@@ -54,7 +54,7 @@ class PlayerController extends ChangeNotifier {
       status == BridgeStatus.connected ||
       status == BridgeStatus.connecting;
 
-  Future<void> connect(String rawHost) async {
+  Future<void> connect(String rawHost, {String pairCode = ''}) async {
     await disconnect(keepNav: true);
     demoMode = false;
     host = rawHost.trim();
@@ -66,6 +66,7 @@ class PlayerController extends ChangeNotifier {
 
     await client.connect(
       host,
+      pairCode: pairCode,
       onState: _onRemoteState,
       previousState: () => state,
       onSpectrum: (bands) => spectrum.value = bands,

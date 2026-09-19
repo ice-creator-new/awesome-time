@@ -39,6 +39,60 @@ DEFAULT_PORT = 8765
 DEFAULT_DISCOVERY_PORT = 8766
 DISCOVERY_MAGIC = "AWESOME_TIME_DISCOVER"
 VALID_ACTIONS = ("playPause", "next", "prev", "seek", "volume")
+
+PAIR_ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
+PAIR_CODE_LEN = 6
+
+
+class PairGate:
+    """LAN pairing gate: random short code unless disabled."""
+
+    def __init__(self) -> None:
+        self.enabled = True
+        self.code = ""
+
+    def configure(self, *, enabled: bool, fixed: Optional[str] = None) -> None:
+        self.enabled = enabled
+        if not enabled:
+            self.code = ""
+            return
+        if fixed:
+            cleaned = "".join(ch for ch in fixed.upper() if ch.isalnum())
+            self.code = cleaned[:PAIR_CODE_LEN] or generate_pair_code()
+        else:
+            self.code = generate_pair_code()
+
+    def required(self) -> bool:
+        return bool(self.enabled and self.code)
+
+    def check(self, candidate: Any) -> bool:
+        if not self.required():
+            return True
+        if candidate is None:
+            return False
+        got = str(candidate).strip().upper()
+        return got == self.code
+
+
+def generate_pair_code(length: int = PAIR_CODE_LEN) -> str:
+    import secrets
+    return "".join(secrets.choice(PAIR_ALPHABET) for _ in range(length))
+
+
+PAIR = PairGate()
+
+
+def extract_pair_code(handler: "Handler") -> Optional[str]:
+    raw = handler.headers.get("X-Awesome-Pair") or handler.headers.get("x-awesome-pair")
+    if raw:
+        return raw.strip()
+    if "?" in handler.path:
+        from urllib.parse import parse_qs, urlparse
+        qs = parse_qs(urlparse(handler.path).query)
+        vals = qs.get("code") or qs.get("pair")
+        if vals:
+            return vals[0]
+    return None
 # Push at least this often while clients are attached so the phone does not
 # rely on long stretches of local wall-clock interpolation.
 POSITION_PUSH_INTERVAL_S = 0.5
@@ -656,18 +710,36 @@ class WSHub:
 HUB = WSHub()
 
 
+def _ws_send_snapshot(client: WSClient) -> None:
+    client.send_text(
+        json.dumps(
+            {"type": "state", **_light_state(STORE.snapshot())},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+    )
+    client.send_text(json.dumps({"type": "art", "seq": STORE.snapshot().get("seq", 0)}))
+
+
 def handle_ws_connection(client: WSClient) -> None:
-    HUB.add(client)
+    paired = not PAIR.required()
+    if paired:
+        HUB.add(client)
     try:
-        # Immediate snapshot so UI paints right away.
+        # Announce whether pairing is required; never send the code itself.
         client.send_text(
             json.dumps(
-                {"type": "state", **_light_state(STORE.snapshot())},
+                {
+                    "type": "hello_ack",
+                    "pairRequired": PAIR.required(),
+                    "app": "awesome-time-bridge",
+                },
                 ensure_ascii=False,
                 separators=(",", ":"),
             )
         )
-        client.send_text(json.dumps({"type": "art", "seq": STORE.snapshot().get("seq", 0)}))
+        if paired:
+            _ws_send_snapshot(client)
         while client.alive:
             try:
                 opcode, payload = client.read_frame()
@@ -691,21 +763,53 @@ def handle_ws_connection(client: WSClient) -> None:
             if not isinstance(data, dict):
                 continue
             msg_type = str(data.get("type") or "")
+            if msg_type in ("hello", "pair"):
+                code = data.get("code") or data.get("pairCode") or data.get("pair")
+                if PAIR.check(code):
+                    if not paired:
+                        paired = True
+                        HUB.add(client)
+                    client.send_text(
+                        json.dumps(
+                            {"type": "pair_ok", "pairRequired": False},
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        )
+                    )
+                    _ws_send_snapshot(client)
+                else:
+                    client.send_text(
+                        json.dumps(
+                            {
+                                "type": "error",
+                                "error": "bad_pair_code",
+                                "message": "配对码错误",
+                            },
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        )
+                    )
+                    break
+                continue
+            if not paired:
+                client.send_text(
+                    json.dumps(
+                        {
+                            "type": "error",
+                            "error": "pair_required",
+                            "message": "请先发送配对码",
+                        },
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                )
+                continue
             if msg_type == "cmd":
                 action = str(data.get("action") or "")
                 if action in VALID_ACTIONS:
                     execute_command(action, data.get("value"), data.get("valueMs"))
             elif msg_type == "ping":
                 client.send_text(json.dumps({"type": "pong", "t": int(time.time() * 1000)}))
-            elif msg_type == "hello":
-                client.send_text(
-                    json.dumps(
-                        {"type": "state", **_light_state(STORE.snapshot())},
-                        ensure_ascii=False,
-                        separators=(",", ":"),
-                    )
-                )
-                client.send_text(json.dumps({"type": "art", "seq": STORE.snapshot().get("seq", 0)}))
     finally:
         HUB.remove(client)
         client.close()
@@ -1389,7 +1493,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Awesome-Pair")
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
@@ -1416,12 +1520,19 @@ class Handler(BaseHTTPRequestHandler):
                     "ws": "/ws",
                     "artwork": "/artwork",
                     "clients": HUB.count,
+                    "pairRequired": PAIR.required(),
                 },
             )
         elif path == "/state":
-            self._send_json(200, _light_state(STORE.snapshot()))
+            if PAIR.required() and not PAIR.check(extract_pair_code(self)):
+                self._send_json(401, {"error": "pair_required", "message": "需要配对码"})
+            else:
+                self._send_json(200, _light_state(STORE.snapshot()))
         elif path == "/artwork":
-            self._send_json(200, {"artwork": STORE.artwork_only()})
+            if PAIR.required() and not PAIR.check(extract_pair_code(self)):
+                self._send_json(401, {"error": "pair_required", "message": "需要配对码"})
+            else:
+                self._send_json(200, {"artwork": STORE.artwork_only()})
         elif path == "/ws" and self.headers.get("Upgrade", "").lower() != "websocket":
             # browser opened /ws without upgrade — explain
             self._send_json(426, {"error": "WebSocket Upgrade required", "path": "/ws"})
@@ -1475,6 +1586,17 @@ class Handler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length") or 0)
             raw = self.rfile.read(length) if length else b"{}"
             data = json.loads(raw.decode("utf-8") or "{}")
+            if not isinstance(data, dict):
+                data = {}
+            pair_candidate = (
+                extract_pair_code(self)
+                or data.get("code")
+                or data.get("pairCode")
+                or data.get("pair")
+            )
+            if PAIR.required() and not PAIR.check(pair_candidate):
+                self._send_json(401, {"error": "pair_required", "message": "需要配对码"})
+                return
             code, body = handle_cmd_payload(data)
             self._send_json(code, body)
         except json.JSONDecodeError as exc:
@@ -1786,16 +1908,18 @@ def discovery_loop(discovery_port: int, http_port: int) -> None:
     import socket
 
     name = _bridge_name()
-    reply = json.dumps(
-        {
-            "app": "awesome-time-bridge",
-            "name": name,
-            "port": http_port,
-            "ws": "/ws",
-        },
-        ensure_ascii=False,
-        separators=(",", ":"),
-    ).encode("utf-8")
+    def _reply_bytes() -> bytes:
+        return json.dumps(
+            {
+                "app": "awesome-time-bridge",
+                "name": name,
+                "port": http_port,
+                "ws": "/ws",
+                "pairRequired": PAIR.required(),
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -1831,7 +1955,7 @@ def discovery_loop(discovery_port: int, http_port: int) -> None:
             len(text) < 256 and DISCOVERY_MAGIC in text
         ):
             try:
-                sock.sendto(reply, addr)
+                sock.sendto(_reply_bytes(), addr)
             except OSError:
                 pass
     try:
@@ -1856,7 +1980,18 @@ def main() -> int:
         default=0.25,
         help="poll seconds (default 0.25; progress is pushed over WS every 1s)",
     )
+    parser.add_argument(
+        "--pair-code",
+        default="",
+        help="fixed short pairing code (default: random each run)",
+    )
+    parser.add_argument(
+        "--no-pair",
+        action="store_true",
+        help="disable pairing gate (trusted LAN only)",
+    )
     args = parser.parse_args()
+    PAIR.configure(enabled=not args.no_pair, fixed=(args.pair_code or None))
 
     print("Awesome Time Bridge", file=sys.stderr)
     print(f"platform: {platform.system()} {platform.release()}", file=sys.stderr)
@@ -1894,6 +2029,11 @@ def main() -> int:
     for ip in ips or ["<ip>"]:
         print(f"  → ws://{ip}:{args.port}/ws", file=sys.stderr)
         print(f"  → http://{ip}:{args.port}", file=sys.stderr)
+    if PAIR.required():
+        print(f"配对码 / Pairing code: {PAIR.code}", file=sys.stderr)
+        print("手机连接时输入该短码；重启桥接会换新码（除非 --pair-code）。", file=sys.stderr)
+    else:
+        print("配对门禁已关闭 (--no-pair)。", file=sys.stderr)
     print("在副手机上自动搜索设备，或填入上面任一地址即可连接。", file=sys.stderr)
 
     try:

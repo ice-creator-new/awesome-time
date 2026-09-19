@@ -16,12 +16,18 @@ class ConnectionPage extends StatefulWidget {
 
 class _ConnectionPageState extends State<ConnectionPage> {
   static const _prefsKey = 'bridge_host';
+  static const _prefsPairKey = 'bridge_pair_code';
   final _ctrl = TextEditingController(text: '192.168.1.10:8765');
+  final _pairCtrl = TextEditingController();
   bool _busy = false;
   bool _discovering = false;
   List<DiscoveredBridge> _devices = const [];
   DiscoveredBridge? _selected;
   String? _discoverError;
+
+  bool get _pairLikelyRequired =>
+      _selected?.pairRequired == true ||
+      _devices.any((d) => d.host == _ctrl.text.trim() && d.pairRequired);
 
   @override
   void initState() {
@@ -32,8 +38,12 @@ class _ConnectionPageState extends State<ConnectionPage> {
   Future<void> _bootstrap() async {
     final prefs = await SharedPreferences.getInstance();
     final saved = prefs.getString(_prefsKey);
+    final savedPair = prefs.getString(_prefsPairKey);
     if (saved != null && saved.isNotEmpty && mounted) {
       _ctrl.text = saved;
+    }
+    if (savedPair != null && savedPair.isNotEmpty && mounted) {
+      _pairCtrl.text = savedPair;
     }
     await _startDiscovery();
   }
@@ -41,6 +51,7 @@ class _ConnectionPageState extends State<ConnectionPage> {
   @override
   void dispose() {
     _ctrl.dispose();
+    _pairCtrl.dispose();
     super.dispose();
   }
 
@@ -70,11 +81,16 @@ class _ConnectionPageState extends State<ConnectionPage> {
           _discoverError = '未发现设备，可手动输入地址';
         }
       });
-      // Single device on the LAN: connect automatically.
+      // Single device: auto-connect only when pairing is off or we already
+      // have a saved pairing code.
       if (devices.length == 1 && mounted && !_busy) {
-        await Future<void>.delayed(const Duration(milliseconds: 200));
-        if (mounted && !_busy) {
-          await _connect();
+        final only = devices.first;
+        final haveCode = _pairCtrl.text.trim().isNotEmpty;
+        if (!only.pairRequired || haveCode) {
+          await Future<void>.delayed(const Duration(milliseconds: 200));
+          if (mounted && !_busy) {
+            await _connect();
+          }
         }
       }
     } catch (e) {
@@ -107,8 +123,24 @@ class _ConnectionPageState extends State<ConnectionPage> {
           return;
         }
         final prefs = await SharedPreferences.getInstance();
+        final pairCode = _pairCtrl.text.trim().toUpperCase();
+        if (_pairLikelyRequired && pairCode.isEmpty) {
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(
+                content: Text('请输入电脑终端显示的配对码'),
+                backgroundColor: AppColors.surface2,
+              ),
+            );
+          }
+          setState(() => _busy = false);
+          return;
+        }
         await prefs.setString(_prefsKey, host);
-        await c.connect(host);
+        if (pairCode.isNotEmpty) {
+          await prefs.setString(_prefsPairKey, pairCode);
+        }
+        await c.connect(host, pairCode: pairCode);
         await Future<void>.delayed(const Duration(milliseconds: 350));
         if (!c.isConnected && mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
@@ -256,7 +288,9 @@ class _ConnectionPageState extends State<ConnectionPage> {
                           ),
                         ),
                         subtitle: Text(
-                          device.host,
+                          device.pairRequired
+                              ? '${device.host} · 需要配对码'
+                              : device.host,
                           style: const TextStyle(
                             color: AppColors.muted,
                             fontSize: 12,
@@ -316,6 +350,44 @@ class _ConnectionPageState extends State<ConnectionPage> {
                     setState(() => _selected = match.first);
                   }
                 },
+                onSubmitted: (_) => _connect(),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: _pairCtrl,
+                enabled: !_busy,
+                autocorrect: false,
+                textCapitalization: TextCapitalization.characters,
+                keyboardType: TextInputType.visiblePassword,
+                inputFormatters: [
+                  FilteringTextInputFormatter.allow(RegExp(r'[0-9a-zA-Z]')),
+                  LengthLimitingTextInputFormatter(8),
+                ],
+                style: const TextStyle(
+                  fontSize: 16,
+                  letterSpacing: 2,
+                  fontFeatures: [FontFeature.tabularFigures()],
+                ),
+                decoration: InputDecoration(
+                  labelText: _pairLikelyRequired ? '配对码（必填）' : '配对码（桥接开启时）',
+                  hintText: '终端里的 6 位短码',
+                  helperText: '看电脑运行 bridge 时打印的「配对码 / Pairing code」',
+                  labelStyle: const TextStyle(color: AppColors.muted),
+                  helperStyle: const TextStyle(color: AppColors.muted, fontSize: 11),
+                  filled: true,
+                  fillColor: AppColors.surface,
+                  border: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(12),
+                    borderSide: BorderSide.none,
+                  ),
+                  focusedBorder: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(12),
+                    borderSide: const BorderSide(
+                      color: AppColors.accent,
+                      width: 1.5,
+                    ),
+                  ),
+                ),
                 onSubmitted: (_) => _connect(),
               ),
               const SizedBox(height: 20),
