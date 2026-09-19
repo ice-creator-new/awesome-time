@@ -102,6 +102,16 @@ awesome_time/
   docs/screenshots/    界面截图
 ```
 
+## CI：自动打安卓包
+
+仓库已配置 GitHub Actions（`.github/workflows/android-apk.yml`）：
+
+- **触发**：推送到 `main`、开/更新 PR，或手动 `workflow_dispatch`
+- **产物**：`app-release.apk`（Artifacts，保留约 14 天）
+- **说明**：当前 release 仍使用 debug 签名（与 `android/app/build.gradle.kts` 一致），方便内测安装；上架或对外分发前请换成自己的 keystore，并在仓库 Secrets 里配置签名信息
+
+跑完后在 Actions 对应 run 里下载 Artifact 即可。
+
 ## 许可
 
 个人项目，按原样提供。
