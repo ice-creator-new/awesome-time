@@ -31,7 +31,7 @@
 | 接口 | 作用 |
 |------|------|
 | `WS /ws` | 推送播放状态和频谱；接收控制命令。进度约每 0.5s 推送一次 |
-| `UDP :8766` | 局域网设备发现（`AWESOME_TIME_DISCOVER`） |
+| `UDP :8766` | 局域网设备发现（`AWESOME_TIME_DISCOVER`）；回复含 `pairRequired`，不含配对码本身 |
 | `GET /artwork` | 单独拉封面，避免大图堵住频谱 |
 | `GET /state` | HTTP 回退 |
 | `POST /cmd` | HTTP 回退控制 |
@@ -44,10 +44,15 @@
 ```bash
 python3 bridge/awesome_bridge.py
 # 默认端口 8765，会打印局域网地址，例如 ws://192.168.1.10:8765/ws
+# 同时打印「配对码 / Pairing code: XXXXXX」——手机连接页要填这个短码
 ```
 
 ```bash
 python3 bridge/awesome_bridge.py --port 8765 --interval 0.25
+# 固定配对码（方便调试）：
+python3 bridge/awesome_bridge.py --pair-code AB12CD
+# 信任局域网、关闭配对（旧客户端行为）：
+python3 bridge/awesome_bridge.py --no-pair
 ```
 
 桥接只用 Python 标准库，没有第三方依赖。
@@ -75,7 +80,8 @@ brew install nowplaying-cli
 
 ## 2. 运行手机客户端
 
-手机和电脑在同一 Wi-Fi：
+手机和电脑在同一 Wi-Fi。若桥接开启了配对（默认开启），在连接页填入终端打印的 **6 位配对码**：
+
 
 ```bash
 flutter pub get

@@ -32,6 +32,8 @@ class BridgeClient {
   int _retry = 0;
   String _base = '';
   String _wsUrl = '';
+  String _pairCode = '';
+  bool pairRequired = false;
   DateTime? _lastStateAt;
 
   void Function(MediaState state)? _onState;
@@ -47,6 +49,7 @@ class BridgeClient {
 
   Future<void> connect(
     String host, {
+    String pairCode = '',
     required void Function(MediaState state) onState,
     MediaState Function()? previousState,
     void Function(List<double> bands)? onSpectrum,
@@ -64,6 +67,8 @@ class BridgeClient {
     final normalized = normalizeHost(host);
     _base = normalized;
     _wsUrl = '${httpToWs(normalized)}/ws';
+    _pairCode = pairCode.trim().toUpperCase();
+    pairRequired = false;
     _retry = 0;
     _everUp = false;
     onStatus(BridgeStatus.connecting, null);
@@ -106,7 +111,11 @@ class BridgeClient {
       if (up) {
         _retry = 0;
         _onStatus?.call(BridgeStatus.connected, null);
-        ch.sink.add(jsonEncode({'type': 'hello'}));
+        if (_pairCode.isNotEmpty) {
+          ch.sink.add(jsonEncode({'type': 'hello', 'code': _pairCode}));
+        } else {
+          ch.sink.add(jsonEncode({'type': 'hello'}));
+        }
         _startHeartbeat();
         _startHttpPoll();
         return;
@@ -184,6 +193,38 @@ class BridgeClient {
     if (text.isEmpty) return;
     final json = jsonDecode(text) as Map<String, dynamic>;
     final type = json['type'] as String? ?? '';
+    if (type == 'hello_ack') {
+      pairRequired = json['pairRequired'] == true;
+      if (pairRequired && _pairCode.isEmpty) {
+        _onStatus?.call(BridgeStatus.error, '需要配对码');
+        return;
+      }
+      if (_pairCode.isNotEmpty) {
+        _channel?.sink.add(
+          jsonEncode({'type': 'hello', 'code': _pairCode}),
+        );
+      } else if (!pairRequired) {
+        _channel?.sink.add(jsonEncode({'type': 'hello'}));
+      }
+      return;
+    }
+    if (type == 'pair_ok') {
+      pairRequired = false;
+      _everUp = true;
+      _retry = 0;
+      _onStatus?.call(BridgeStatus.connected, null);
+      return;
+    }
+    if (type == 'error') {
+      final err = json['error']?.toString() ?? '';
+      final msg = json['message']?.toString();
+      if (err == 'bad_pair_code' || err == 'pair_required') {
+        _onStatus?.call(BridgeStatus.error, msg ?? '配对码错误');
+        return;
+      }
+      _onStatus?.call(BridgeStatus.error, msg ?? err);
+      return;
+    }
     if (type == 'pong') {
       _everUp = true;
       _onStatus?.call(BridgeStatus.connected, null);
@@ -306,6 +347,8 @@ class BridgeClient {
     _channel = null;
     _base = '';
     _wsUrl = '';
+    _pairCode = '';
+    pairRequired = false;
     _everUp = false;
     _lastStateAt = null;
     _onState = null;
@@ -319,7 +362,9 @@ class BridgeClient {
     Duration timeout = const Duration(seconds: 3),
   }) async {
     if (_base.isEmpty) throw BridgeException('未连接桥接服务');
-    final res = await _client.get(_stateUri).timeout(timeout);
+    final res = await _client
+        .get(_stateUri, headers: _pairHeaders())
+        .timeout(timeout);
     if (res.statusCode != 200) {
       throw BridgeException('状态接口返回 ${res.statusCode}');
     }
@@ -331,7 +376,9 @@ class BridgeClient {
     Duration timeout = const Duration(seconds: 4),
   }) async {
     if (_base.isEmpty) return '';
-    final res = await _client.get(Uri.parse('$_base/artwork')).timeout(timeout);
+    final res = await _client
+        .get(Uri.parse('$_base/artwork'), headers: _pairHeaders())
+        .timeout(timeout);
     if (res.statusCode != 200) return '';
     final json = jsonDecode(utf8.decode(res.bodyBytes)) as Map<String, dynamic>;
     return (json['artwork'] as String?) ?? '';
@@ -360,16 +407,25 @@ class BridgeClient {
     final httpBody = <String, Object?>{'action': action};
     if (value != null) httpBody['value'] = value;
     if (valueMs != null) httpBody['valueMs'] = valueMs;
+    if (_pairCode.isNotEmpty) httpBody['code'] = _pairCode;
     final res = await _client
         .post(
           _cmdUri,
-          headers: {'content-type': 'application/json'},
+          headers: {
+            'content-type': 'application/json',
+            ..._pairHeaders(),
+          },
           body: utf8.encode(jsonEncode(httpBody)),
         )
         .timeout(const Duration(seconds: 3));
     if (res.statusCode != 200) {
       throw BridgeException('控制命令失败 (${res.statusCode})');
     }
+  }
+
+  Map<String, String> _pairHeaders() {
+    if (_pairCode.isEmpty) return const {};
+    return {'X-Awesome-Pair': _pairCode};
   }
 
   static String normalizeHost(String host) {

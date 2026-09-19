@@ -8,11 +8,13 @@ class DiscoveredBridge {
     required this.ip,
     required this.port,
     required this.name,
+    this.pairRequired = false,
   });
 
   final String ip;
   final int port;
   final String name;
+  final bool pairRequired;
 
   String get host => '$ip:$port';
 
@@ -102,7 +104,13 @@ class DeviceDiscovery {
           : fromIp;
       if (ip.isEmpty || ip.startsWith('127.')) return null;
       final name = (json['name'] as String?)?.trim() ?? '';
-      return DiscoveredBridge(ip: ip, port: port, name: name);
+      final pairRequired = json['pairRequired'] == true;
+      return DiscoveredBridge(
+        ip: ip,
+        port: port,
+        name: name,
+        pairRequired: pairRequired,
+      );
     } catch (_) {
       return null;
     }
