@@ -17,22 +17,31 @@ from __future__ import annotations
 
 import argparse
 import base64
+import errno
 import hashlib
 import json
 import platform
+import select
 import shutil
+import socket
 import struct
 import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Optional
 
 
 DEFAULT_PORT = 8765
+DEFAULT_DISCOVERY_PORT = 8766
+DISCOVERY_MAGIC = "AWESOME_TIME_DISCOVER"
 VALID_ACTIONS = ("playPause", "next", "prev", "seek", "volume")
+# Push at least this often while clients are attached so the phone does not
+# rely on long stretches of local wall-clock interpolation.
+POSITION_PUSH_INTERVAL_S = 0.5
 
 
 def _empty_state(source: str = "") -> dict[str, Any]:
@@ -60,6 +69,9 @@ class StateStore:
         self._playing = False
         self._seq = 0
         self._hold_until = 0.0
+        # Last positive position sample from the OS player (detects staleness).
+        self._last_raw_pos = -1
+        self._last_raw_wall = 0.0
         self.spectrum: list[float] = [0.0] * 32
 
     def set_spectrum(self, bands: list[float]) -> None:
@@ -93,6 +105,11 @@ class StateStore:
             return [round(x, 3) for x in self.spectrum]
 
     def update_from_capture(self, incoming: dict[str, Any]) -> bool:
+        """Fold an OS sample into the store.
+
+        Returns True when metadata/playing changed OR the playhead jumped
+        (seek on the phone or on the computer) so the poller can push at once.
+        """
         with self.lock:
             title = str(incoming.get("title") or "")
             playing = bool(incoming.get("playing"))
@@ -104,32 +121,59 @@ class StateStore:
             prev_title = self.state.get("title") or ""
             prev_src = self.state.get("source") or ""
             src = str(incoming.get("source") or "")
-            track_changed = title != prev_title or (src and prev_src and src != prev_src)
+            # Provisional: filled more carefully after new_title is known below.
+            track_changed = bool(title) and (
+                title != prev_title or (src and prev_src and src != prev_src)
+            )
             holding = (not track_changed) and wall < self._hold_until
             if holding:
                 playing = self._playing
 
+            pos_before = self._local_pos_ms
+
             if track_changed:
                 self._hold_until = 0.0
-                self._local_pos_ms = raw_pos
-                self._local_pos_wall = wall
+                # Only snap to 0 when the OS really reports start-of-track.
+                # A dead MediaRemote (elapsed=0) must not reset a mid-song head.
+                if raw_pos > 0:
+                    self._local_pos_ms = raw_pos
+                    self._local_pos_wall = wall
+                    self._last_raw_pos = raw_pos
+                    self._last_raw_wall = wall
+                else:
+                    # New/unknown head: keep wall base at 0 start, but let the
+                    # next positive classic-player sample correct us immediately.
+                    self._local_pos_ms = 0
+                    self._local_pos_wall = wall
+                    self._last_raw_pos = -1
+                    self._last_raw_wall = 0.0
             elif playing:
                 extrap = self._read_extrapolated_locked()
-                # MediaRemote often reports elapsed=0 / stale. Trust capture only
-                # when it moved far from our clock (real seek / new sample), never
-                # snap back to 0 just because the API returned 0.
-                if raw_pos > 100 and abs(raw_pos - extrap) > 3000:
-                    self._local_pos_ms = raw_pos
-                    self._local_pos_wall = wall
+                if raw_pos > 0:
+                    # Any positive sample wins — classic player / working elapsed.
+                    # This is what picks up scrubbing on the Mac.
+                    if (
+                        self._last_raw_pos < 0
+                        or raw_pos != self._last_raw_pos
+                        or abs(raw_pos - extrap) > 400
+                    ):
+                        self._local_pos_ms = raw_pos
+                        self._local_pos_wall = wall
+                        self._last_raw_pos = raw_pos
+                        self._last_raw_wall = wall
+                        if abs(raw_pos - pos_before) >= 400:
+                            pass  # caller marks changed via pos_before diff
+                    # else: same sample, keep extrapolating
                 elif self._local_pos_wall == 0:
-                    self._local_pos_ms = raw_pos
+                    self._local_pos_ms = 0
                     self._local_pos_wall = wall
-                # else keep extrapolating from last trusted base
+                # else: playing with dead elapsed — extrapolate last trusted head
             else:
-                # paused: adopt capture if plausible, else freeze
-                if raw_pos > 0 and abs(raw_pos - self._read_extrapolated_locked()) > 2000:
+                if raw_pos > 0:
                     self._local_pos_ms = raw_pos
                     self._local_pos_wall = wall
+                    self._last_raw_pos = raw_pos
+                    self._last_raw_wall = wall
                 else:
                     self._local_pos_ms = self._read_extrapolated_locked()
                     self._local_pos_wall = wall
@@ -141,8 +185,19 @@ class StateStore:
             if vol is None:
                 vol = self.state.get("volume", 0.5)
 
-            new_title = title if (title or track_changed) else prev_title
-            new_src = src if src else ("" if track_changed else prev_src)
+            # Never blank the title mid-track because one capture returned "".
+            new_title = title if title else prev_title
+            new_src = src if src else prev_src
+            # Title really changed only when both sides non-empty and differ,
+            # or incoming is a clear new non-empty title.
+            if title and prev_title and title != prev_title:
+                track_changed = True
+                self._hold_until = 0.0
+            elif title and not prev_title:
+                track_changed = True
+            elif not title:
+                track_changed = False
+
             incoming_art = str(incoming.get("artwork") or "")
             incoming_art_url = str(incoming.get("artworkUrl") or "")
             prev = self.state
@@ -164,6 +219,10 @@ class StateStore:
             if incoming_art_url and incoming_art_url != prev_art_url:
                 changed = True
 
+            # Large playhead jump (seek on Mac or phone) → push immediately.
+            if abs(self._local_pos_ms - pos_before) >= 400:
+                changed = True
+
             self.state.update(
                 {
                     "playing": playing,
@@ -176,8 +235,13 @@ class StateStore:
                     "durationMs": dur,
                     "volume": float(vol) if vol is not None else 0.5,
                     "updatedAtMs": now_ms,
+                    "positionMs": self._read_extrapolated_locked(),
                 }
             )
+            if dur:
+                self.state["positionMs"] = min(
+                    int(self.state["positionMs"]), int(dur)
+                )
             self._seq += 1
             return changed
 
@@ -228,6 +292,8 @@ class StateStore:
             elif action == "seek" and value_ms is not None:
                 self._local_pos_ms = max(0, int(value_ms))
                 self._local_pos_wall = time.time()
+                self._last_raw_pos = self._local_pos_ms
+                self._last_raw_wall = time.time()
                 self.state["positionMs"] = self._local_pos_ms
             elif action == "volume" and value is not None:
                 try:
@@ -238,6 +304,8 @@ class StateStore:
                 self.state["positionMs"] = 0
                 self._local_pos_ms = 0
                 self._local_pos_wall = time.time()
+                self._last_raw_pos = -1
+                self._last_raw_wall = 0.0
             self.state["updatedAtMs"] = int(time.time() * 1000)
             self._seq += 1
             out = dict(self.state)
@@ -261,6 +329,80 @@ _os_cmd_lock = threading.Lock()
 _os_exec_lock = threading.Lock()
 _os_cmd_seq = 0
 CLASSIC_PLAYERS = ("Music", "Spotify", "Podcasts", "Audible", "VLC", "IINA")
+
+
+def _classic_player_sample(preferred: str = "") -> Optional[dict[str, Any]]:
+    """Read real transport from a desktop player via AppleScript.
+
+    MediaRemote on this machine often reports elapsedTime=0 and
+    applicationDisplayName=null — phone seek still worked only because it
+    wrote the store directly. Computer-side scrubbing needs this path.
+    """
+    global _last_script_pos_at
+    apps: list[str] = []
+    if preferred and preferred in CLASSIC_PLAYERS:
+        apps.append(preferred)
+    if LAST_SOURCE in CLASSIC_PLAYERS and LAST_SOURCE not in apps:
+        apps.append(LAST_SOURCE)
+    for app in CLASSIC_PLAYERS:
+        if app not in apps:
+            apps.append(app)
+
+    now = time.time()
+    # Avoid hammering osascript on every 250ms tick when nothing changed.
+    if now - _last_script_pos_at < 0.2:
+        return None
+
+    for app in apps:
+        script = f'''
+        tell application "System Events"
+          if not (exists process "{app}") then return ""
+        end tell
+        tell application "{app}"
+          try
+            set t to name of current track
+          on error
+            return ""
+          end try
+          if t is "" then return ""
+          set ar to artist of current track
+          set al to album of current track
+          set dur to duration of current track
+          set playState to (player state as text)
+          set pos to 0
+          try
+            set pos to player position
+          end try
+          return t & "\\t" & ar & "\\t" & al & "\\t" & dur & "\\t" & pos & "\\t" & playState
+        end tell
+        '''
+        out = run_osascript(script, timeout=0.4)
+        if not out or "\t" not in out:
+            continue
+        parts = out.split("\t")
+        while len(parts) < 6:
+            parts.append("")
+        t, ar, al, dur, pos, play_raw = parts[:6]
+        if not t:
+            continue
+        pos_ms = int(_to_float(pos) * 1000)
+        dur_ms = int(_to_float(dur) * 1000)
+        st_l = play_raw.lower()
+        playing = st_l.startswith("play") or st_l in (
+            "fast forwarding",
+            "rewinding",
+        )
+        _last_script_pos_at = now
+        return {
+            "playing": playing,
+            "title": t,
+            "artist": ar,
+            "album": al,
+            "source": app,
+            "positionMs": pos_ms,
+            "durationMs": dur_ms,
+        }
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -287,6 +429,30 @@ def _encode_text_frame(payload: str) -> bytes:
     return header + data
 
 
+def _encode_binary_frame(payload: bytes) -> bytes:
+    """WS binary frame (opcode 0x2). Spectrum uses this — no JSON on the wire."""
+    n = len(payload)
+    if n < 126:
+        header = struct.pack("!BB", 0x82, n)
+    elif n < 65536:
+        header = struct.pack("!BBH", 0x82, 126, n)
+    else:
+        header = struct.pack("!BBQ", 0x82, 127, n)
+    return header + payload
+
+
+def encode_spectrum_frame(bands: list[float]) -> bytes:
+    """Binary spectrum: 0x53, count, uint8 levels[count]."""
+    n = len(bands)
+    buf = bytearray(n + 2)
+    buf[0] = 0x53  # 'S'
+    buf[1] = n & 0xFF
+    for i, x in enumerate(bands):
+        v = int(x * 255.0 + 0.5)
+        buf[2 + i] = 0 if v < 0 else (255 if v > 255 else v)
+    return _encode_binary_frame(bytes(buf))
+
+
 def _encode_control_frame(opcode: int, payload: bytes = b"") -> bytes:
     n = len(payload)
     if n > 125:
@@ -296,25 +462,117 @@ def _encode_control_frame(opcode: int, payload: bytes = b"") -> bytes:
 
 
 class WSClient:
+    """Outbound WS with a dedicated sender thread.
+
+    Critical for spectrum: never block the audio reader on a slow TCP window.
+    Droppable frames (spectrum) coalesce to the latest only.
+    """
+
     def __init__(self, sock: Any) -> None:
         self.sock = sock
+        try:
+            self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
         self.alive = True
-        self._send_lock = threading.Lock()
+        self._cv = threading.Condition()
+        self._queue: deque[bytes] = deque()
+        self._droppable: bytes | None = None
+        self._out = bytearray()
+        self._sender = threading.Thread(
+            target=self._send_loop,
+            name="ws-send",
+            daemon=True,
+        )
+        self._sender.start()
 
-    def send_text(self, text: str) -> bool:
+    def send_text(self, text: str, *, droppable: bool = False) -> bool:
         if not self.alive:
             return False
         try:
             frame = _encode_text_frame(text)
-            with self._send_lock:
-                self.sock.sendall(frame)
-            return True
-        except OSError:
-            self.alive = False
+        except Exception:  # noqa: BLE001
             return False
+        return self.send_frame(frame, droppable=droppable)
+
+    def send_frame(self, frame: bytes, *, droppable: bool = False) -> bool:
+        if not self.alive:
+            return False
+        with self._cv:
+            if droppable:
+                # Latest-wins: drop any unsent spectrum frame.
+                self._droppable = frame
+            else:
+                if len(self._queue) > 64:
+                    self._queue.popleft()
+                self._queue.append(frame)
+            self._cv.notify()
+        return True
+
+    def _send_loop(self) -> None:
+        # Keep the socket blocking for the reader thread. Only this send
+        # path is non-blocking (MSG_DONTWAIT) so a full TCP window cannot
+        # stall stdout reads or the state pusher.
+        flags = getattr(socket, "MSG_DONTWAIT", 0)
+        would_block = {errno.EAGAIN, errno.EWOULDBLOCK}
+        while self.alive:
+            with self._cv:
+                if not self._out:
+                    # Spectrum first when both are ready: visual cadence
+                    # matters more than a queued state duplicate.
+                    if self._droppable is not None:
+                        self._out.extend(self._droppable)
+                        self._droppable = None
+                    elif self._queue:
+                        self._out.extend(self._queue.popleft())
+                    else:
+                        self._cv.wait(0.1)
+                        continue
+            blocked = False
+            while self._out and self.alive:
+                try:
+                    n = self.sock.send(self._out, flags)
+                    if n <= 0:
+                        raise ConnectionError("send returned 0")
+                    del self._out[:n]
+                except (BlockingIOError, InterruptedError):
+                    blocked = True
+                    break
+                except OSError as exc:
+                    if exc.errno in would_block:
+                        blocked = True
+                        break
+                    self._fail()
+                    break
+            if self.alive and blocked and self._out:
+                try:
+                    select.select([], [self.sock], [], 0.05)
+                except (OSError, ValueError):
+                    self._fail()
+
+    def _fail(self) -> None:
+        self.alive = False
+        with self._cv:
+            self._cv.notify_all()
+        try:
+            self.sock.shutdown(2)
+        except OSError:
+            pass
+
+    def flush(self, timeout: float = 0.2) -> None:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            with self._cv:
+                if not self._out and not self._queue and self._droppable is None:
+                    return
+            time.sleep(0.01)
 
     def close(self) -> None:
+        if self.alive:
+            self.flush(0.15)
         self.alive = False
+        with self._cv:
+            self._cv.notify_all()
         try:
             self.sock.shutdown(2)
         except OSError:
@@ -362,13 +620,25 @@ class WSHub:
         with self._lock:
             self._clients.discard(client)
 
-    def broadcast_obj(self, obj: Any) -> None:
+    def broadcast_obj(self, obj: Any, *, droppable: bool = False) -> None:
         text = json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+        frame = _encode_text_frame(text)
+        self._broadcast_frame(frame, droppable=droppable)
+
+    def broadcast_spectrum(self, bands: list[float]) -> None:
+        """Binary latest-wins spectrum — smaller and faster than JSON."""
+        if not bands:
+            return
+        self._broadcast_frame(encode_spectrum_frame(bands), droppable=True)
+
+    def _broadcast_frame(self, frame: bytes, *, droppable: bool = False) -> None:
         with self._lock:
             clients = list(self._clients)
+        if not clients:
+            return
         dead: list[WSClient] = []
         for c in clients:
-            if not c.send_text(text):
+            if not c.send_frame(frame, droppable=droppable):
                 dead.append(c)
         if dead:
             with self._lock:
@@ -403,21 +673,11 @@ def handle_ws_connection(client: WSClient) -> None:
                 opcode, payload = client.read_frame()
             except (OSError, ConnectionError, struct.error):
                 break
-            if opcode == 0x8:  # close
-                try:
-                    with client._send_lock:
-                        client.sock.sendall(_encode_control_frame(0x8, payload[:125]))
-                except OSError:
-                    pass
+            if opcode == 0x8:  # close — enqueue so we don't block the reader
+                client.send_frame(_encode_control_frame(0x8, payload[:125]))
                 break
             if opcode == 0x9:  # ping -> pong
-                if not client.send_text(""):  # keep send path warm
-                    pass
-                try:
-                    with client._send_lock:
-                        client.sock.sendall(_encode_control_frame(0xA, payload))
-                except OSError:
-                    client.alive = False
+                if not client.send_frame(_encode_control_frame(0xA, payload)):
                     break
                 continue
             if opcode == 0xA:  # pong
@@ -521,15 +781,17 @@ def _to_float(v: Any, default: float = 0.0) -> float:
 
 def _is_playing(v: Any) -> bool:
     if v is None:
-        # Short-key isPlaying is often null while MediaRemote still has a title;
-        # treat unknown-with-title as playing so UI doesn't stick on PAUSED.
-        return False
+        # Callers only use this when a title is present. MediaRemote often
+        # omits isPlaying — assume playing so the clock keeps moving with the PC.
+        return True
     if isinstance(v, bool):
         return v
     if isinstance(v, (int, float)):
         return v == 1
     s = str(v).strip().lower()
     if s in ("null", "none", ""):
+        return True
+    if s in ("0", "false", "no", "paused", "stopped"):
         return False
     return s in ("1", "true", "yes", "playing")
 
@@ -553,9 +815,9 @@ def capture_macos() -> dict[str, Any]:
         "playbackRate",
     ]
     # Hot path: never fetch artworkData (huge, slow). Cover is polled on track change.
-    raw = nowplaying_cli(["get", "--json", *art_keys], timeout=0.45)
+    raw = nowplaying_cli(["get", "--json", *art_keys], timeout=0.35)
     if not raw:
-        raw = nowplaying_cli(["get-raw"], timeout=0.6)
+        raw = nowplaying_cli(["get-raw"], timeout=0.45)
 
     data: dict[str, Any] = {}
     if raw:
@@ -626,31 +888,31 @@ def capture_macos() -> dict[str, Any]:
         dur_ms = int(_to_float(duration) * 1000)
         is_pl = _is_playing(playing)
 
-        # Classic players: rare position correction when MediaRemote elapsed is 0.
-        global _last_script_pos_at
-        app = src_label if src_label in CLASSIC_PLAYERS else ""
-        if dur_ms > 0 and pos_ms <= 0 and app and (time.time() - _last_script_pos_at) > 2.5:
-            _last_script_pos_at = time.time()
-            script = f'''
-            tell application "{app}"
-              try
-                set st to (player state as text)
-                set pos to 0
-                try
-                  set pos to player position
-                end try
-                return st & "\\t" & pos
-              on error
-                return ""
-              end try
-            end tell
-            '''
-            out = run_osascript(script, timeout=0.5)
-            if out and "\t" in out:
-                st, pos_s = out.split("\t", 1)
-                if st.lower().startswith("play") and _to_float(pos_s) > 0:
-                    pos_ms = int(_to_float(pos_s) * 1000)
-                    is_pl = True
+        # MediaRemote elapsed is hard-zero on many Macs; displayName may be null.
+        # Always resolve position from a real player when elapsed is dead.
+        preferred = src_label if src_label in CLASSIC_PLAYERS else ""
+        if pos_ms <= 0 or not is_pl or not src_label or src_label in ("", "macOS"):
+            hint = _classic_player_sample(preferred)
+            if hint:
+                if hint["positionMs"] > 0:
+                    pos_ms = hint["positionMs"]
+                if hint["durationMs"] > 0 and dur_ms <= 0:
+                    dur_ms = hint["durationMs"]
+                is_pl = hint["playing"]
+                src_label = hint["source"]
+                # Dead MediaRemote metadata → trust the live player wholesale.
+                if pos_ms <= 0 or str(title) != hint["title"]:
+                    if pos_ms <= 0:
+                        title = hint["title"]
+                        artist = hint.get("artist") or artist
+                        album = hint.get("album") or album
+                        if hint["durationMs"] > 0:
+                            dur_ms = hint["durationMs"]
+                        is_pl = hint["playing"]
+                        src_label = hint["source"]
+                        # Keep MediaRemote duration when present and plausible.
+                        if int(_to_float(duration) * 1000) > 0:
+                            dur_ms = int(_to_float(duration) * 1000)
 
         return {
             "playing": is_pl,
@@ -664,7 +926,23 @@ def capture_macos() -> dict[str, Any]:
             "durationMs": dur_ms,
         }
 
+    # --- No MediaRemote title: fall back to a live classic player ---
+    hint = _classic_player_sample("")
+    if hint and hint["title"]:
+        return {
+            "playing": hint["playing"],
+            "title": hint["title"],
+            "artist": hint["artist"],
+            "album": hint["album"],
+            "source": hint["source"],
+            "artworkUrl": "",
+            "artwork": "",
+            "positionMs": hint["positionMs"],
+            "durationMs": hint["durationMs"],
+        }
+
     # --- AppleScript fallbacks: classic players with full transport ---
+    # Short timeouts — this loop must not freeze capture for seconds.
     for app in ("Music", "Spotify", "Podcasts", "Audible", "VLC", "IINA"):
         script = f'''
         tell application "System Events"
@@ -679,26 +957,27 @@ def capture_macos() -> dict[str, Any]:
           set ar to artist of current track
           set al to album of current track
           set dur to duration of current track
-          set st to (player state as text)
+          set playState to (player state as text)
           set pos to 0
           try
             set pos to player position
           end try
-          return t & "\\t" & ar & "\\t" & al & "\\t" & dur & "\\t" & pos & "\\t" & st
+          return t & "\\t" & ar & "\\t" & al & "\\t" & dur & "\\t" & pos & "\\t" & playState
         end tell
         '''
-        out = run_osascript(script, timeout=1.2)
+        out = run_osascript(script, timeout=0.45)
         if out and "\t" in out:
             parts = out.split("\t")
             while len(parts) < 6:
                 parts.append("")
-            t, ar, al, dur, pos, st = parts[:6]
+            t, ar, al, dur, pos, play_raw = parts[:6]
+            st_l = play_raw.lower()
             return {
-                "playing": st in (
-                    "playing",
+                "playing": st_l.startswith("play")
+                or st_l in (
                     "fast forwarding",
                     "rewinding",
-                    "Playing",
+                    "playing",
                 ),
                 "title": t,
                 "artist": ar,
@@ -1132,6 +1411,8 @@ class Handler(BaseHTTPRequestHandler):
                 {
                     "ok": True,
                     "app": "awesome-time-bridge",
+                    "name": _bridge_name(),
+                    "port": int(getattr(self.server, "bridge_port", 0) or 0),
                     "ws": "/ws",
                     "artwork": "/artwork",
                     "clients": HUB.count,
@@ -1154,6 +1435,14 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(426, {"error": "WebSocket Upgrade required"})
             return
         accept = _ws_accept_key(key)
+        # Echo the client's subprotocol when present (Dart requests awesome-time).
+        req_proto = (self.headers.get("Sec-WebSocket-Protocol") or "").strip()
+        proto_header = ""
+        if req_proto:
+            # Accept the first token only.
+            first = req_proto.split(",")[0].strip()
+            if first and all(c.isalnum() or c in "-_" for c in first):
+                proto_header = f"Sec-WebSocket-Protocol: {first}\r\n"
         try:
             self.wfile.write(
                 (
@@ -1161,6 +1450,7 @@ class Handler(BaseHTTPRequestHandler):
                     "Upgrade: websocket\r\n"
                     "Connection: Upgrade\r\n"
                     f"Sec-WebSocket-Accept: {accept}\r\n"
+                    f"{proto_header}"
                     "\r\n"
                 ).encode("ascii")
             )
@@ -1286,8 +1576,11 @@ def ensure_audio_tap_binary() -> Optional[Path]:
 
 
 def audio_tap_loop() -> None:
-    """Read 32 FFT bands from the system-audio tap and push over WS."""
-    last_push = 0.0
+    """Read 32 FFT bands from the system-audio tap into the store only.
+
+    Network I/O lives in spectrum_pusher so a slow client cannot stall
+    the stdout reader (that was the stutter source).
+    """
     while True:
         if platform.system() != "Darwin":
             time.sleep(5)
@@ -1333,10 +1626,6 @@ def audio_tap_loop() -> None:
                 if len(bands) < 8:
                     continue
                 STORE.set_spectrum(bands)
-                now = time.time()
-                if HUB.count and now - last_push >= 0.033:
-                    last_push = now
-                    HUB.broadcast_obj({"type": "spectrum", "v": STORE.spectrum_copy()})
         except Exception as exc:  # noqa: BLE001
             print(f"[bridge] audio tap read error: {exc}", file=sys.stderr)
         rc = proc.poll()
@@ -1354,9 +1643,39 @@ def audio_tap_loop() -> None:
             time.sleep(2)
 
 
+SPECTRUM_PUSH_HZ = 50.0
+
+
+def spectrum_pusher() -> None:
+    """Deadline-based sample-and-hold push at a fixed rate.
+
+    No wall-clock 10ms polling (that quantized periods to ~40ms and left
+    50–75ms gaps). Always send the latest store — never skip "unchanged"
+    keys (that stalled the bar animation on stable spectra).
+    """
+    interval = 1.0 / SPECTRUM_PUSH_HZ
+    next_t = time.perf_counter()
+    print(f"[bridge] spectrum pusher {SPECTRUM_PUSH_HZ:.0f}Hz binary", file=sys.stderr)
+    while True:
+        next_t += interval
+        now = time.perf_counter()
+        if next_t < now - 0.05:
+            # Fell far behind (laptop sleep / GC) — realign, don't burst.
+            next_t = now + interval
+        delay = next_t - now
+        if delay > 0:
+            time.sleep(delay)
+        try:
+            if not HUB.count:
+                next_t = time.perf_counter()
+                continue
+            HUB.broadcast_spectrum(STORE.spectrum_copy())
+        except Exception as exc:  # noqa: BLE001
+            print(f"[bridge] spectrum push error: {exc}", file=sys.stderr)
+
+
 def poller(interval: float) -> None:
     print(f"[bridge] poller every {interval:.2f}s", file=sys.stderr)
-    last_push = 0.0
     last_meta_json = ""
     global LAST_SOURCE
     while True:
@@ -1366,7 +1685,25 @@ def poller(interval: float) -> None:
             changed = STORE.update_from_capture(snap_cap)
             snap = STORE.snapshot()
             LAST_SOURCE = str(snap.get("source") or LAST_SOURCE)
-            if HUB.count:
+            if changed:
+                # Metadata / seek — push ASAP (position pusher handles cadence).
+                light = _light_state(snap)
+                meta = {
+                    k: light.get(k)
+                    for k in (
+                        "playing",
+                        "title",
+                        "artist",
+                        "album",
+                        "source",
+                        "durationMs",
+                    )
+                }
+                last_meta_json = json.dumps(meta, ensure_ascii=False, sort_keys=True)
+                if HUB.count:
+                    HUB.broadcast_obj({"type": "state", **light})
+            else:
+                # Detect meta-only changes without requiring a full push here.
                 light = _light_state(snap)
                 meta = {
                     k: light.get(k)
@@ -1380,23 +1717,34 @@ def poller(interval: float) -> None:
                     )
                 }
                 meta_json = json.dumps(meta, ensure_ascii=False, sort_keys=True)
-                now = time.time()
-                playing = bool(snap.get("playing"))
-                # Metadata immediately; position only as a sparse clock correction.
-                if changed or meta_json != last_meta_json:
-                    HUB.broadcast_obj({"type": "state", **light})
+                if meta_json != last_meta_json:
                     last_meta_json = meta_json
-                    last_push = now
-                elif playing and (now - last_push) >= 2.0:
-                    HUB.broadcast_obj({"type": "state", **light})
-                    last_push = now
-                elif (now - last_push) >= 5.0:
-                    HUB.broadcast_obj({"type": "state", **light})
-                    last_push = now
+                    if HUB.count:
+                        HUB.broadcast_obj({"type": "state", **light})
         except Exception as exc:  # noqa: BLE001
             print(f"[bridge] poll error: {exc}", file=sys.stderr)
         elapsed = time.time() - started
         time.sleep(max(0.02, interval - elapsed))
+
+
+def state_pusher() -> None:
+    """Independent of capture() so a slow AppleScript never stalls WS state."""
+    last_push = 0.0
+    print(
+        f"[bridge] state pusher every {POSITION_PUSH_INTERVAL_S}s",
+        file=sys.stderr,
+    )
+    while True:
+        try:
+            if HUB.count:
+                now = time.time()
+                if (now - last_push) + 1e-9 >= POSITION_PUSH_INTERVAL_S:
+                    light = _light_state(STORE.snapshot())
+                    HUB.broadcast_obj({"type": "state", **light})
+                    last_push = now
+        except Exception as exc:  # noqa: BLE001
+            print(f"[bridge] state push error: {exc}", file=sys.stderr)
+        time.sleep(0.1)
 
 
 def lan_ips() -> list[str]:
@@ -1424,15 +1772,89 @@ def lan_ips() -> list[str]:
     return out
 
 
+def _bridge_name() -> str:
+    import socket
+
+    try:
+        return socket.gethostname() or "Awesome Time Bridge"
+    except Exception:
+        return "Awesome Time Bridge"
+
+
+def discovery_loop(discovery_port: int, http_port: int) -> None:
+    """Answer UDP probes so the phone can list every bridge on the LAN."""
+    import socket
+
+    name = _bridge_name()
+    reply = json.dumps(
+        {
+            "app": "awesome-time-bridge",
+            "name": name,
+            "port": http_port,
+            "ws": "/ws",
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        except OSError:
+            pass
+        sock.bind(("", discovery_port))
+        sock.settimeout(1.0)
+    except OSError as exc:
+        print(f"[bridge] discovery bind failed on {discovery_port}: {exc}", file=sys.stderr)
+        return
+
+    print(
+        f"[bridge] discovery udp://{discovery_port} ({name})",
+        file=sys.stderr,
+    )
+    while True:
+        try:
+            data, addr = sock.recvfrom(2048)
+        except socket.timeout:
+            continue
+        except OSError:
+            break
+        try:
+            text = data.decode("utf-8", errors="ignore").strip()
+        except Exception:
+            continue
+        if not text:
+            continue
+        # Accept bare magic or small JSON probes containing the magic.
+        if text == DISCOVERY_MAGIC or (
+            len(text) < 256 and DISCOVERY_MAGIC in text
+        ):
+            try:
+                sock.sendto(reply, addr)
+            except OSError:
+                pass
+    try:
+        sock.close()
+    except OSError:
+        pass
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Awesome Time LAN bridge")
     parser.add_argument("--host", default="0.0.0.0", help="bind address")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument(
+        "--discovery-port",
+        type=int,
+        default=DEFAULT_DISCOVERY_PORT,
+        help="UDP port for LAN device discovery (default 8766)",
+    )
+    parser.add_argument(
         "--interval",
         type=float,
         default=0.25,
-        help="poll seconds (default 0.25; progress is interpolated on the phone)",
+        help="poll seconds (default 0.25; progress is pushed over WS every 1s)",
     )
     args = parser.parse_args()
 
@@ -1445,21 +1867,34 @@ def main() -> int:
             "nowplaying-cli: not found — browser/系统级媒体请安装: brew install nowplaying-cli",
             file=sys.stderr,
         )
-    print("transport: WebSocket /ws + HTTP fallback /state /cmd", file=sys.stderr)
+    print(
+        "transport: WebSocket /ws (state ~0.5s) + HTTP fallback /state /cmd + UDP discovery",
+        file=sys.stderr,
+    )
 
     th = threading.Thread(target=poller, args=(args.interval,), daemon=True)
     th.start()
+    threading.Thread(target=state_pusher, daemon=True).start()
+    if platform.system() == "Darwin":
+        threading.Thread(target=spectrum_pusher, daemon=True).start()
     threading.Thread(target=artwork_poller, daemon=True).start()
     threading.Thread(target=audio_tap_loop, daemon=True).start()
+    threading.Thread(
+        target=discovery_loop,
+        args=(args.discovery_port, args.port),
+        daemon=True,
+    ).start()
 
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     server.daemon_threads = True
+    server.bridge_port = args.port  # type: ignore[attr-defined]
     ips = lan_ips()
     print(f"listening on {args.host}:{args.port}", file=sys.stderr)
+    print(f"discovery udp:{args.discovery_port}", file=sys.stderr)
     for ip in ips or ["<ip>"]:
         print(f"  → ws://{ip}:{args.port}/ws", file=sys.stderr)
         print(f"  → http://{ip}:{args.port}", file=sys.stderr)
-    print("在副手机上填入上面任一地址即可连接（自动走 WebSocket）。", file=sys.stderr)
+    print("在副手机上自动搜索设备，或填入上面任一地址即可连接。", file=sys.stderr)
 
     try:
         server.serve_forever()

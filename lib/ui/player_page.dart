@@ -24,7 +24,7 @@ class PlayerPage extends StatelessWidget {
         systemNavigationBarColor: Colors.transparent,
       ),
       child: Scaffold(
-        backgroundColor: Colors.black,
+        backgroundColor: const Color(0xFF0A0C10),
         extendBody: true,
         extendBodyBehindAppBar: true,
         body: Stack(
@@ -63,17 +63,9 @@ class _NowPlaying extends StatelessWidget {
   Widget _portrait(BuildContext context) {
     final st = controller.state;
     return Padding(
-      padding: const EdgeInsets.fromLTRB(24, 12, 24, 16),
+      padding: const EdgeInsets.fromLTRB(24, 16, 24, 16),
       child: Column(
         children: [
-          Align(
-            alignment: Alignment.centerLeft,
-            child: _ChromeButton(
-              glyph: PlayerGlyph.chevronDown,
-              onTap: controller.leaveToConnect,
-            ),
-          ),
-          const SizedBox(height: 8),
           Expanded(
             child: Padding(
               padding: const EdgeInsets.symmetric(horizontal: 8),
@@ -192,14 +184,6 @@ class _NowPlaying extends StatelessWidget {
             },
           ),
         ),
-        Positioned(
-          left: 8,
-          top: 4,
-          child: _ChromeButton(
-            glyph: PlayerGlyph.chevronDown,
-            onTap: controller.leaveToConnect,
-          ),
-        ),
       ],
     );
   }
@@ -246,29 +230,6 @@ class _PlaybackStack extends StatelessWidget {
         SizedBox(height: compact ? 4 : 8),
         NowPlayingVolume(volume: st.volume, onChange: controller.setVolume),
       ],
-    );
-  }
-}
-
-class _ChromeButton extends StatelessWidget {
-  const _ChromeButton({required this.glyph, required this.onTap});
-
-  final PlayerGlyph glyph;
-  final VoidCallback onTap;
-
-  @override
-  Widget build(BuildContext context) {
-    return SizedBox(
-      width: 44,
-      height: 44,
-      child: IconButton(
-        onPressed: onTap,
-        icon: PlayerIcon(
-          glyph: glyph,
-          color: Colors.white.withValues(alpha: 0.92),
-          size: 22,
-        ),
-      ),
     );
   }
 }

@@ -74,7 +74,7 @@ class _AwesomeTimeAppState extends State<AwesomeTimeApp> {
     return ChangeNotifierProvider<PlayerController>.value(
       value: _controller,
       child: MaterialApp(
-        title: 'Awesome Time',
+        title: '妙时',
         debugShowCheckedModeBanner: false,
         theme: buildAppTheme(),
         navigatorKey: _navKey,

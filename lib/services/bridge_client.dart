@@ -26,11 +26,13 @@ class BridgeClient {
   StreamSubscription? _wsSub;
   Timer? _reconnectTimer;
   Timer? _heartbeatTimer;
+  Timer? _httpPollTimer;
   bool _disposed = false;
   bool _everUp = false;
   int _retry = 0;
   String _base = '';
   String _wsUrl = '';
+  DateTime? _lastStateAt;
 
   void Function(MediaState state)? _onState;
   MediaState Function()? _previousState;
@@ -106,6 +108,7 @@ class BridgeClient {
         _onStatus?.call(BridgeStatus.connected, null);
         ch.sink.add(jsonEncode({'type': 'hello'}));
         _startHeartbeat();
+        _startHttpPoll();
         return;
       }
 
@@ -113,10 +116,12 @@ class BridgeClient {
       try {
         final st = await fetchState();
         _onState?.call(st);
+        _lastStateAt = DateTime.now();
         _everUp = true;
         _retry = 0;
         _onStatus?.call(BridgeStatus.connected, null);
         _startHeartbeat();
+        _startHttpPoll();
         // Keep trying WS in background for pushes.
         _scheduleReconnect();
         return;
@@ -129,9 +134,12 @@ class BridgeClient {
         try {
           final st = await fetchState();
           _onState?.call(st);
+          _lastStateAt = DateTime.now();
           _everUp = true;
           _retry = 0;
           _onStatus?.call(BridgeStatus.connected, null);
+          _startHeartbeat();
+          _startHttpPoll();
           _scheduleReconnect();
           return;
         } catch (_) {}
@@ -143,44 +151,99 @@ class BridgeClient {
   void _handleMessage(dynamic raw) {
     if (_disposed) return;
     try {
+      if (raw is List<int>) {
+        _handleBinary(raw);
+        return;
+      }
       final text = raw is String ? raw : utf8.decode(raw as List<int>);
-      if (text.isEmpty) return;
-      final json = jsonDecode(text) as Map<String, dynamic>;
-      final type = json['type'] as String? ?? '';
-      if (type == 'pong') {
-        _everUp = true;
-        _onStatus?.call(BridgeStatus.connected, null);
-        return;
-      }
-      if (type == 'spectrum') {
-        final raw = json['v'];
-        if (raw is List) {
-          _onSpectrum?.call(
-            raw.map((e) => (e is num) ? e.toDouble() : 0.0).toList(),
-          );
-        }
-        return;
-      }
-      if (type == 'art') {
-        _onArt?.call();
-        return;
-      }
-      if (type == 'state' || json.containsKey('title')) {
-        final stateJson = type == 'state'
-            ? (Map<String, dynamic>.from(json)..remove('type'))
-            : json;
-        final state = MediaState.fromJson(
-          stateJson,
-          previous: _previousState?.call(),
-        );
-        _everUp = true;
-        _retry = 0;
-        _onState?.call(state);
-        _onStatus?.call(BridgeStatus.connected, null);
-      }
+      _handleText(text);
     } catch (_) {
       // ignore malformed frames
     }
+  }
+
+  /// Binary spectrum: 'S' | count | uint8[count]  (no JSON on the hot path).
+  void _handleBinary(List<int> data) {
+    if (data.length < 3 || data[0] != 0x53) {
+      try {
+        _handleText(utf8.decode(data));
+      } catch (_) {}
+      return;
+    }
+    final n = data[1];
+    if (n <= 0 || data.length < 2 + n) return;
+    final bands = List<double>.filled(n, 0);
+    for (var i = 0; i < n; i++) {
+      bands[i] = data[2 + i] / 255.0;
+    }
+    // Direct — Waveform samples this on its ticker; a Timer only added jitter.
+    _onSpectrum?.call(bands);
+  }
+
+  void _handleText(String text) {
+    if (text.isEmpty) return;
+    final json = jsonDecode(text) as Map<String, dynamic>;
+    final type = json['type'] as String? ?? '';
+    if (type == 'pong') {
+      _everUp = true;
+      _onStatus?.call(BridgeStatus.connected, null);
+      return;
+    }
+    if (type == 'spectrum') {
+      final raw = json['v'];
+      if (raw is List) {
+        _onSpectrum?.call([
+          for (final e in raw)
+            if (e is num) e.toDouble() else 0.0,
+        ]);
+      }
+      return;
+    }
+    if (type == 'art') {
+      _onArt?.call();
+      return;
+    }
+    if (type == 'state' || json.containsKey('title')) {
+      final stateJson = type == 'state'
+          ? (Map<String, dynamic>.from(json)..remove('type'))
+          : json;
+      final state = MediaState.fromJson(
+        stateJson,
+        previous: _previousState?.call(),
+      );
+      _everUp = true;
+      _retry = 0;
+      _lastStateAt = DateTime.now();
+      _onState?.call(state);
+      _onStatus?.call(BridgeStatus.connected, null);
+    }
+  }
+
+  /// LAN belt-and-suspenders: if WS is quiet for >600ms, pull /state.
+  /// Also the sole progress source when the socket is stuck on HTTP fallback.
+  void _startHttpPoll() {
+    _httpPollTimer?.cancel();
+    _httpPollTimer = Timer.periodic(const Duration(milliseconds: 500), (_) async {
+      if (_disposed || _base.isEmpty) return;
+      final wsFresh = _channel != null &&
+          _lastStateAt != null &&
+          DateTime.now().difference(_lastStateAt!) <
+              const Duration(milliseconds: 600);
+      if (wsFresh) return;
+      try {
+        final st = await fetchState(
+          timeout: const Duration(milliseconds: 800),
+        );
+        if (_disposed) return;
+        _everUp = true;
+        _retry = 0;
+        _lastStateAt = DateTime.now();
+        _onState?.call(st);
+        _onStatus?.call(BridgeStatus.connected, null);
+      } catch (_) {
+        // Keep trying; WS reconnect handles hard failures.
+      }
+    });
   }
 
   void _handleDown(String message) {
@@ -192,6 +255,8 @@ class BridgeClient {
     _channel = null;
     _heartbeatTimer?.cancel();
     _heartbeatTimer = null;
+    // Keep HTTP poll alive so progress still advances while WS is down.
+    _startHttpPoll();
     _onStatus?.call(
       BridgeStatus.error,
       wasUp ? message : (message.isEmpty ? '连接失败' : message),
@@ -231,6 +296,8 @@ class BridgeClient {
     _reconnectTimer = null;
     _heartbeatTimer?.cancel();
     _heartbeatTimer = null;
+    _httpPollTimer?.cancel();
+    _httpPollTimer = null;
     await _wsSub?.cancel();
     _wsSub = null;
     try {
@@ -240,6 +307,7 @@ class BridgeClient {
     _base = '';
     _wsUrl = '';
     _everUp = false;
+    _lastStateAt = null;
     _onState = null;
     _previousState = null;
     _onSpectrum = null;

@@ -2,7 +2,7 @@ import 'package:flutter/material.dart';
 
 /// Desk instrument palette — charcoal chassis, amber signal.
 abstract final class AppColors {
-  static const bg = Color(0xFF050508);
+  static const bg = Color(0xFF0A0C10);
   static const surface = Color(0xFF141A1F);
   static const surface2 = Color(0xFF1C242B);
   static const ink = Color(0xFFE6EDF3);

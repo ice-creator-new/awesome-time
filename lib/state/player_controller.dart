@@ -27,7 +27,10 @@ class PlayerController extends ChangeNotifier {
   String host = '';
 
   DateTime? _lastRemoteAt;
-  DateTime? _holdRemoteUntil;
+  /// Only blocks remote *position* while a local seek is settling.
+  DateTime? _holdPositionUntil;
+  /// Brief optimistic play/pause icon; position still follows the bridge.
+  DateTime? _holdPlayingUntil;
   Timer? _volumeDebounce;
   Uint8List? artworkBytes;
   List<Color> palette = ArtworkPalette.fallback;
@@ -80,17 +83,32 @@ class PlayerController extends ChangeNotifier {
         state.source != remote.source ||
         state.updatedAtMs == 0;
 
-    final holding = _holdRemoteUntil != null && now.isBefore(_holdRemoteUntil!);
+    final holdPos = _holdPositionUntil != null && now.isBefore(_holdPositionUntil!);
+    final holdPlay = _holdPlayingUntil != null && now.isBefore(_holdPlayingUntil!);
 
-    if (!holding || trackChanged) {
+    if (trackChanged) {
+      _holdPositionUntil = null;
+      _holdPlayingUntil = null;
+    }
+
+    // A large remote jump means the user scrubbed on the computer — never
+    // keep a local seek hold against that.
+    final jump = (remote.positionMs - clock.positionMs).abs();
+    final acceptRemotePos = trackChanged || !holdPos || jump >= 1200;
+    if (acceptRemotePos && jump >= 1200) {
+      _holdPositionUntil = null;
+    }
+
+    if (acceptRemotePos) {
       clock.applyRemote(
         positionMs: remote.positionMs,
         durationMs: remote.durationMs,
-        playing: remote.playing,
-        force: trackChanged,
+        playing: (holdPlay && !trackChanged) ? state.playing : remote.playing,
+        force: trackChanged || jump >= 1200,
       );
     } else {
       clock.durationMs = remote.durationMs;
+      clock.playing = (holdPlay && !trackChanged) ? state.playing : remote.playing;
     }
 
     var volume = remote.volume;
@@ -98,13 +116,7 @@ class PlayerController extends ChangeNotifier {
       volume = state.volume;
     }
 
-    final playing = (holding && !trackChanged) ? state.playing : remote.playing;
-
-    final visualChanged =
-        trackChanged ||
-        state.playing != playing ||
-        (state.volume - volume).abs() > 0.008 ||
-        state.artist != remote.artist;
+    final playing = clock.playing;
 
     state = remote.copyWith(
       playing: playing,
@@ -120,9 +132,8 @@ class PlayerController extends ChangeNotifier {
     if (trackChanged) {
       _pullArtwork();
     }
-    if (visualChanged || trackChanged) {
-      notifyListeners();
-    }
+    // Always notify: WS position samples are the source of truth for progress.
+    notifyListeners();
   }
 
   void _onStatus(BridgeStatus next, String? message) {
@@ -171,6 +182,8 @@ class PlayerController extends ChangeNotifier {
     _demoTimer = null;
     _volumeDebounce?.cancel();
     _lastRemoteAt = null;
+    _holdPositionUntil = null;
+    _holdPlayingUntil = null;
     everConnected = false;
     await client.disconnect();
     status = BridgeStatus.idle;
@@ -194,6 +207,8 @@ class PlayerController extends ChangeNotifier {
     _demoTimer = null;
     _volumeDebounce?.cancel();
     _lastRemoteAt = null;
+    _holdPositionUntil = null;
+    _holdPlayingUntil = null;
     everConnected = false;
     await client.disconnect();
     status = BridgeStatus.idle;
@@ -232,7 +247,8 @@ class PlayerController extends ChangeNotifier {
     final ms = (f.clamp(0.0, 1.0) * state.durationMs).round();
     clock.durationMs = state.durationMs;
     clock.seek(ms);
-    _holdRemoteUntil = DateTime.now().add(const Duration(milliseconds: 700));
+    // Block remote position only briefly so the seek is not undone mid-flight.
+    _holdPositionUntil = DateTime.now().add(const Duration(milliseconds: 300));
     state = state.copyWith(
       positionMs: ms,
       updatedAtMs: DateTime.now().millisecondsSinceEpoch,
@@ -268,7 +284,8 @@ class PlayerController extends ChangeNotifier {
     }
 
     if (action == 'playPause' || action == 'next' || action == 'prev') {
-      _holdRemoteUntil = DateTime.now().add(const Duration(milliseconds: 1400));
+      // Optimistic icon only — position keeps following bridge samples.
+      _holdPlayingUntil = DateTime.now().add(const Duration(milliseconds: 600));
     }
 
     if (action == 'playPause') {
@@ -277,7 +294,7 @@ class PlayerController extends ChangeNotifier {
         positionMs: clock.positionMs,
         durationMs: state.durationMs,
         playing: nextPlaying,
-        force: true,
+        force: false,
       );
       state = state.copyWith(
         playing: nextPlaying,
@@ -295,7 +312,7 @@ class PlayerController extends ChangeNotifier {
           positionMs: clock.positionMs,
           durationMs: state.durationMs,
           playing: !state.playing,
-          force: true,
+          force: false,
         );
         state = state.copyWith(
           playing: !state.playing,

@@ -1,14 +1,11 @@
-/// Wall-clock playhead. The UI interpolates locally so progress is 60fps-smooth
-/// even when the bridge only sends sparse corrections.
+/// Wall-clock playhead. Between WS samples the UI interpolates for smoothness;
+/// each remote sample is treated as authoritative (server drives progress).
 class PlaybackClock {
   int durationMs = 0;
   bool playing = false;
 
   int _baseMs = 0;
   int _baseWallMs = 0;
-
-  static const _snapJumpMs = 900;
-  static const _ignoreErrorMs = 80;
 
   int positionAt({int? nowMs}) {
     final now = nowMs ?? DateTime.now().millisecondsSinceEpoch;
@@ -45,37 +42,13 @@ class PlaybackClock {
     int? nowMs,
   }) {
     final now = nowMs ?? DateTime.now().millisecondsSinceEpoch;
-    final wasPlaying = this.playing;
-    final predicted = positionAt(nowMs: now);
     this.durationMs = durationMs;
-
-    if (force) {
-      _baseMs = positionMs < 0 ? 0 : positionMs;
-      _baseWallMs = now;
-      this.playing = playing;
-      return;
-    }
-
-    final jump = (positionMs - predicted).abs();
-
-    if (playing != wasPlaying) {
-      _baseMs = predicted;
-      _baseWallMs = now;
-      this.playing = playing;
-      return;
-    }
-
+    var next = positionMs < 0 ? 0 : positionMs;
+    if (durationMs > 0 && next > durationMs) next = durationMs;
+    // Server sample is authoritative — both first paint (force) and later
+    // corrections rebase here so local wall clock cannot drift away from WS.
+    _baseMs = next;
+    _baseWallMs = now;
     this.playing = playing;
-
-    if (jump > _snapJumpMs) {
-      _baseMs = positionMs < 0 ? 0 : positionMs;
-      _baseWallMs = now;
-      return;
-    }
-
-    if (jump > _ignoreErrorMs) {
-      _baseMs = predicted + ((positionMs - predicted) * 0.25).round();
-      _baseWallMs = now;
-    }
   }
 }

@@ -6,7 +6,7 @@ import 'package:flutter/scheduler.dart';
 
 import 'artwork_palette.dart';
 
-/// Two-color flowing field sampled from the album, heavily blurred, no white fringe.
+/// Three-color flowing field sampled from the album, heavily blurred.
 class AmbientBackdrop extends StatefulWidget {
   const AmbientBackdrop({
     super.key,
@@ -34,7 +34,7 @@ class _AmbientBackdropState extends State<AmbientBackdrop>
   @override
   void initState() {
     super.initState();
-    _to = _pair(widget.colors);
+    _to = _trio(widget.colors);
     _from = _to;
     _ticker = createTicker(_onTick)..start();
     _loadShader();
@@ -54,9 +54,10 @@ class _AmbientBackdropState extends State<AmbientBackdrop>
         ? 0.016
         : (elapsed - _lastElapsed).inMicroseconds / 1e6;
     _lastElapsed = elapsed;
-    _time += dt * (widget.playing ? 1.0 : 0.18);
+    // Playing: gentle readable drift; paused: barely-there crawl.
+    _time += dt * (widget.playing ? 0.70 : 0.18);
     if (_mix < 1) {
-      _mix = (_mix + dt / 1.2).clamp(0.0, 1.0);
+      _mix = (_mix + dt / 0.7).clamp(0.0, 1.0);
     }
     setState(() {});
   }
@@ -66,15 +67,17 @@ class _AmbientBackdropState extends State<AmbientBackdrop>
     super.didUpdateWidget(old);
     if (!_sameColors(old.colors, widget.colors)) {
       _from = _mixed();
-      _to = _pair(widget.colors);
+      _to = _trio(widget.colors);
       _mix = 0;
     }
   }
 
-  List<Color> _pair(List<Color> colors) {
-    if (colors.length >= 2) return [colors[0], colors[1]];
-    if (colors.length == 1) return [colors[0], ArtworkPalette.fallback[1]];
-    return ArtworkPalette.fallback;
+  List<Color> _trio(List<Color> colors) {
+    final fb = ArtworkPalette.fallback;
+    if (colors.length >= 3) return colors.sublist(0, 3);
+    if (colors.length == 2) return [colors[0], colors[1], fb[2]];
+    if (colors.length == 1) return [colors[0], fb[1], fb[2]];
+    return fb;
   }
 
   bool _sameColors(List<Color> a, List<Color> b) {
@@ -87,11 +90,12 @@ class _AmbientBackdropState extends State<AmbientBackdrop>
 
   List<Color> _mixed() {
     final t = Curves.easeInOut.transform(_mix);
-    final from = _pair(_from);
-    final to = _pair(_to);
+    final from = _trio(_from);
+    final to = _trio(_to);
     return [
       Color.lerp(from[0], to[0], t)!,
       Color.lerp(from[1], to[1], t)!,
+      Color.lerp(from[2], to[2], t)!,
     ];
   }
 
@@ -111,7 +115,7 @@ class _AmbientBackdropState extends State<AmbientBackdrop>
             painter: _ShaderPainter(
               program: program,
               time: _time,
-              speed: widget.playing ? 1 : 0.2,
+              speed: widget.playing ? 1 : 0.15,
               colors: colors,
             ),
             child: const SizedBox.expand(),
@@ -137,7 +141,7 @@ class _AmbientBackdropState extends State<AmbientBackdrop>
                 child: field,
               ),
             ),
-            const ColoredBox(color: Color(0x40000000)),
+            const ColoredBox(color: Color(0x14000000)),
           ],
         ),
       ),
@@ -166,11 +170,15 @@ class _ShaderPainter extends CustomPainter {
     shader.setFloat(2, time);
     shader.setFloat(3, speed);
     var i = 4;
-    for (final c in colors.take(2)) {
+    for (final c in colors.take(3)) {
       shader.setFloat(i++, c.r);
       shader.setFloat(i++, c.g);
       shader.setFloat(i++, c.b);
       shader.setFloat(i++, 1);
+    }
+    // Shader expects 3 colors; pad if caller passed fewer.
+    while (i < 4 + 12) {
+      shader.setFloat(i++, 0);
     }
     canvas.drawRect(Offset.zero & size, Paint()..shader = shader);
   }
@@ -188,39 +196,57 @@ class _BlobPainter extends CustomPainter {
 
   @override
   void paint(Canvas canvas, Size size) {
-    final a = colors[0];
+    final a = colors.isNotEmpty ? colors[0] : ArtworkPalette.fallback[0];
     final b = colors.length > 1 ? colors[1] : a;
+    final c = colors.length > 2 ? colors[2] : b;
     canvas.drawRect(Offset.zero & size, Paint()..color = a);
     final cx = size.width / 2;
     final cy = size.height / 2;
     final m = size.longestSide;
+    final t = time * 0.35;
     final blobs = <(Offset, Color, double)>[
       (
         Offset(
-          cx + m * 0.16 * math.sin(time * 0.21),
-          cy - m * 0.12 * math.cos(time * 0.17),
+          cx + m * 0.22 * math.sin(t * 0.75),
+          cy - m * 0.18 * math.cos(t * 0.60),
         ),
         a,
-        m * 0.78,
+        m * 0.85,
       ),
       (
         Offset(
-          cx - m * 0.18 * math.cos(time * 0.15),
-          cy + m * 0.14 * math.sin(time * 0.19),
+          cx - m * 0.24 * math.cos(t * 0.55),
+          cy + m * 0.20 * math.sin(t * 0.70),
         ),
         b,
-        m * 0.7,
+        m * 0.80,
+      ),
+      (
+        Offset(
+          cx + m * 0.18 * math.sin(t * 0.90 + 1.4),
+          cy + m * 0.22 * math.cos(t * 0.65 + 0.4),
+        ),
+        c,
+        m * 0.75,
       ),
     ];
+    // Overlapping soft lobes — paint order + alpha produces a melt look.
     for (final (origin, color, radius) in blobs) {
       canvas.drawCircle(
         origin,
         radius,
         Paint()
-          ..shader = ui.Gradient.radial(origin, radius, [
-            color,
-            color.withValues(alpha: 0),
-          ]),
+          ..blendMode = BlendMode.srcOver
+          ..shader = ui.Gradient.radial(
+            origin,
+            radius,
+            [
+              color.withValues(alpha: 0.95),
+              color.withValues(alpha: 0.55),
+              color.withValues(alpha: 0.0),
+            ],
+            const [0.0, 0.45, 1.0],
+          ),
       );
     }
   }

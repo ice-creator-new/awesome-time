@@ -32,6 +32,11 @@ final class Tap: NSObject, SCStreamOutput, SCStreamDelegate {
     private var smooth: [Float]
     private let bands = 32
     private var lastEmit = CFAbsoluteTimeGetCurrent()
+    private var lastTick = CFAbsoluteTimeGetCurrent()
+    private var samplesSinceAnalyze = 0
+    /// 48kHz / 40Hz — emit FFT on the sample clock, not wall sleep.
+    private var hopSamples = 1200
+    private var agcMax: Float = 1e-6
     private let lock = NSLock()
     private var stream: SCStream?
 
@@ -146,7 +151,11 @@ final class Tap: NSObject, SCStreamOutput, SCStreamDelegate {
         }
         count = filled
         lock.unlock()
-        if count >= n {
+        // Sample-clock hop (1200 @ 48kHz = 40Hz) — wall-clock throttling
+        // was the source of irregular stdout / spectrum timing.
+        samplesSinceAnalyze += frames
+        if count >= n && samplesSinceAnalyze >= hopSamples {
+            samplesSinceAnalyze = 0
             maybeAnalyze()
         }
         _ = block
@@ -154,7 +163,10 @@ final class Tap: NSObject, SCStreamOutput, SCStreamDelegate {
 
     private func maybeAnalyze() {
         let now = CFAbsoluteTimeGetCurrent()
-        if now - lastEmit < 0.033 { return }
+        // Safety only: real cadence comes from hopSamples.
+        if now - lastEmit < 0.012 { return }
+        let dt = Float(max(0.001, now - lastTick))
+        lastTick = now
         lastEmit = now
 
         var frame = [Float](repeating: 0, count: n)
@@ -186,25 +198,62 @@ final class Tap: NSObject, SCStreamOutput, SCStreamDelegate {
             let hi = logFreq(b + 1)
             let i0 = max(1, Int(lo / binHz))
             let i1 = min(n / 2 - 1, max(i0 + 1, Int(hi / binHz)))
+            // Band TOTAL energy (sum), not per-bin average.
+            // Log HF bands span dozens of bins — averaging crushed highs by
+            // ~10–20dB versus narrow bass bands, so the right side went flat.
+            var sum: Float = 0
             var peak: Float = 0
             for i in i0...i1 {
-                if mag[i] > peak { peak = mag[i] }
+                let m = mag[i]
+                sum += m
+                if m > peak { peak = m }
             }
-            // Magnitude is power; sqrt then gentle compression.
-            out[b] = sqrtf(max(peak, 0))
+            // Sum carries the spectrum shape; a little peak keeps attacks alive.
+            // HF gets slightly more peak weight (transients are sparse up there).
+            let hf = Float(b) / Float(bands - 1)
+            let energy = sum * (1.0 - 0.25 * hf) + peak * (0.35 + 0.45 * hf)
+            out[b] = sqrtf(max(energy, 0))
         }
+
+        // Slow-decay AGC on the raw magnitude — fine for overall level.
         var mx: Float = 0
         vDSP_maxv(out, 1, &mx, vDSP_Length(bands))
-        if mx > 1e-6 {
-            var scale = 1 / mx
-            vDSP_vsmul(out, 1, &scale, &out, 1, vDSP_Length(bands))
+        if mx > agcMax {
+            agcMax = mx
+        } else {
+            agcMax = max(mx, agcMax * expf(-dt * 0.85), 1e-6)
         }
+        var scale = 1.0 / agcMax
+        vDSP_vsmul(out, 1, &scale, &out, 1, vDSP_Length(bands))
+
+        // Fast attack / medium release — beats should hit, not melt.
+        let attack: Float = 1 - expf(-dt * 28)
+        let release: Float = 1 - expf(-dt * 7)
+        // Rebuild per-band envelopes with a high shelf so mids/highs dance
+        // even when the kick owns the global AGC peak.
+        var frameMax: Float = 1e-6
+        var shelved = [Float](repeating: 0, count: bands)
         for b in 0..<bands {
-            // Perceptual: boost highs a bit, floor noise.
-            let tilt = 0.65 + 0.55 * Float(b) / Float(bands - 1)
-            var v = min(1, out[b] * tilt)
-            v = powf(v, 0.55)
-            smooth[b] = smooth[b] * 0.45 + v * 0.55
+            let u = Float(b) / Float(bands - 1)
+            // Strong shelf: 0.55× lows → ~2.1× highs after AGC.
+            let shelf = 0.55 + 1.55 * u * u
+            // Soft knee instead of a hard gate (0.04 zeroed quiet highs).
+            let raw = out[b] * shelf
+            shelved[b] = raw
+            if raw > frameMax { frameMax = raw }
+        }
+        // Normalize to the shelved frame max so the right side can actually
+        // reach the ceiling when bass is momentarily dominant.
+        let inv = 1.0 / max(frameMax, 1e-6)
+        for b in 0..<bands {
+            var v = min(1, shelved[b] * inv)
+            // Mild lift only — phone-side used to over-compress and go mushy.
+            v = powf(v, 0.68)
+            // Noise floor relative to frame, not absolute 0.04.
+            if v < 0.06 { v = 0 }
+            let k = v > smooth[b] ? attack : release
+            smooth[b] += (v - smooth[b]) * k
+            if smooth[b] < 0.001 { smooth[b] = 0 }
         }
 
         var line = "s"
@@ -213,6 +262,8 @@ final class Tap: NSObject, SCStreamOutput, SCStreamDelegate {
         }
         line += "\n"
         fputs(line, stdout)
+        // Line-buffered flush keeps Python's reader in lockstep without
+        // waiting on a full 4K stdio block.
         fflush(stdout)
     }
 

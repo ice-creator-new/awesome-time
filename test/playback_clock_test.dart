@@ -30,7 +30,7 @@ void main() {
     expect(clock.positionAt(nowMs: 1_800), 3000);
   });
 
-  test('small remote corrections do not snap the playhead', () {
+  test('every remote sample rebases onto the server position', () {
     final clock = PlaybackClock();
     clock.applyRemote(
       positionMs: 2000,
@@ -39,7 +39,7 @@ void main() {
       force: true,
       nowMs: 10_000,
     );
-    // Local clock has already moved +200ms; remote is only 40ms off predicted.
+    // Local would have predicted 2200; server says 2240 — trust server.
     clock.applyRemote(
       positionMs: 2240,
       durationMs: 20000,
@@ -47,7 +47,8 @@ void main() {
       force: false,
       nowMs: 10_200,
     );
-    expect(clock.positionAt(nowMs: 10_200), 2200);
+    expect(clock.positionAt(nowMs: 10_200), 2240);
+    expect(clock.positionAt(nowMs: 10_700), 2740);
   });
 
   test('large remote jump is treated as a real seek', () {
@@ -69,7 +70,7 @@ void main() {
     expect(clock.positionAt(nowMs: 10_100), 8000);
   });
 
-  test('play/pause keeps predicted position', () {
+  test('play/pause adopts the remote sample position', () {
     final clock = PlaybackClock();
     clock.applyRemote(
       positionMs: 1000,
@@ -78,6 +79,7 @@ void main() {
       force: true,
       nowMs: 0,
     );
+    // Server paused at 1000 even though local had already run to 1500.
     clock.applyRemote(
       positionMs: 1000,
       durationMs: 20000,
@@ -85,7 +87,19 @@ void main() {
       force: false,
       nowMs: 500,
     );
-    expect(clock.positionAt(nowMs: 500), 1500);
-    expect(clock.positionAt(nowMs: 900), 1500);
+    expect(clock.positionAt(nowMs: 500), 1000);
+    expect(clock.positionAt(nowMs: 900), 1000);
+  });
+
+  test('position is clamped to duration', () {
+    final clock = PlaybackClock();
+    clock.applyRemote(
+      positionMs: 25_000,
+      durationMs: 20_000,
+      playing: false,
+      force: true,
+      nowMs: 0,
+    );
+    expect(clock.positionMs, 20_000);
   });
 }
