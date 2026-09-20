@@ -108,8 +108,50 @@ class DeviceDiscovery {
     }
   }
 
+  /// Prefix lengths worth probing. /24 is the home default, but office and
+  /// campus LANs are routinely /19../22 and [NetworkInterface] does not expose
+  /// the netmask, so every plausible subnet broadcast is offered rather than
+  /// guessing one of them.
+  static const List<int> probePrefixLengths = <int>[
+    16, 17, 18, 19, 20, 21, 22, 23, 24,
+  ];
+
+  /// Subnet broadcast addresses [ip] could belong to, most specific last.
+  ///
+  /// A hardcoded /24 (the previous behaviour) turns `10.192.201.26` into
+  /// `10.192.201.255`, which on a real /19 LAN is just some host address — the
+  /// probe never reaches the bridge. Enumerating prefixes keeps the correct
+  /// broadcast in the set no matter how the network is carved up. Exposed for
+  /// tests.
+  static List<String> broadcastCandidates(String ip) {
+    final parts = ip.split('.');
+    if (parts.length != 4) return const <String>[];
+    final octets = <int>[];
+    for (final part in parts) {
+      final value = int.tryParse(part);
+      if (value == null || value < 0 || value > 255) return const <String>[];
+      octets.add(value);
+    }
+    final address =
+        (octets[0] << 24) | (octets[1] << 16) | (octets[2] << 8) | octets[3];
+    final seen = <int>{};
+    final out = <String>[];
+    for (final length in probePrefixLengths) {
+      final mask = (0xFFFFFFFF << (32 - length)) & 0xFFFFFFFF;
+      final broadcast = (address & mask) | (~mask & 0xFFFFFFFF);
+      if (!seen.add(broadcast)) continue;
+      out.add(
+        '${(broadcast >> 24) & 0xFF}.${(broadcast >> 16) & 0xFF}'
+        '.${(broadcast >> 8) & 0xFF}.${broadcast & 0xFF}',
+      );
+    }
+    return out;
+  }
+
   static Future<List<InternetAddress>> _broadcastAddresses() async {
     final addrs = <InternetAddress>{
+      // Limited broadcast: always valid inside our own broadcast domain, and
+      // the one target that needs no netmask knowledge at all.
       InternetAddress('255.255.255.255'),
     };
     try {
@@ -120,10 +162,9 @@ class DeviceDiscovery {
       for (final iface in interfaces) {
         for (final addr in iface.addresses) {
           if (addr.isLoopback) continue;
-          final parts = addr.address.split('.');
-          if (parts.length != 4) continue;
-          // Classful-ish /24 broadcast for the interface subnet.
-          addrs.add(InternetAddress('${parts[0]}.${parts[1]}.${parts[2]}.255'));
+          for (final candidate in broadcastCandidates(addr.address)) {
+            addrs.add(InternetAddress(candidate));
+          }
         }
       }
     } catch (_) {}

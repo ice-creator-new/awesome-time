@@ -21,12 +21,14 @@ import errno
 import hashlib
 import json
 import platform
+import re
 import select
 import shutil
 import socket
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections import deque
@@ -729,8 +731,22 @@ def run_osascript(script: str, timeout: float = 0.8) -> str:
         return ""
 
 
-def nowplaying_cli(args: list[str], timeout: float = 2.0) -> Optional[str]:
+def _nowplaying_exe() -> Optional[str]:
+    """Locate nowplaying-cli even when the bridge was launched without a login
+    shell PATH (Homebrew lives in /opt/homebrew/bin, which is not on the PATH
+    of a LaunchAgent or a GUI-spawned python)."""
     exe = shutil.which("nowplaying-cli")
+    if exe:
+        return exe
+    for extra in ("/opt/homebrew/bin", "/usr/local/bin"):
+        exe = shutil.which("nowplaying-cli", path=extra)
+        if exe:
+            return exe
+    return None
+
+
+def nowplaying_cli(args: list[str], timeout: float = 2.0) -> Optional[str]:
+    exe = _nowplaying_exe()
     if not exe:
         return None
     try:
@@ -1415,6 +1431,7 @@ class Handler(BaseHTTPRequestHandler):
                     "port": int(getattr(self.server, "bridge_port", 0) or 0),
                     "ws": "/ws",
                     "artwork": "/artwork",
+                    "artworkDiag": "/artwork/diag",
                     "clients": HUB.count,
                 },
             )
@@ -1422,6 +1439,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(200, _light_state(STORE.snapshot()))
         elif path == "/artwork":
             self._send_json(200, {"artwork": STORE.artwork_only()})
+        elif path == "/artwork/diag":
+            self._send_json(200, probe_artwork_sources())
         elif path == "/ws" and self.headers.get("Upgrade", "").lower() != "websocket":
             # browser opened /ws without upgrade — explain
             self._send_json(426, {"error": "WebSocket Upgrade required", "path": "/ws"})
@@ -1483,45 +1502,277 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(500, {"error": str(exc)})
 
 
+_ARTWORK_TMP = Path(tempfile.gettempdir()) / "awesome-time-artwork.bin"
+_B64_RE = re.compile(r"^[A-Za-z0-9+/=]+$")
+
+
+def _image_mime(data: bytes) -> str:
+    """Sniff the real image type.
+
+    Music hands back PNG about as often as JPEG, and the phone decodes by
+    content — but a data URL that lies about its type breaks other clients.
+    """
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    if data.startswith(b"BM"):
+        return "image/bmp"
+    return ""
+
+
+def _data_url_from_bytes(data: bytes) -> str:
+    mime = _image_mime(data)
+    if not mime or len(data) < 128:
+        return ""
+    return f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
+
+
 def _artwork_data_url(raw: str) -> str:
     if not raw:
         return ""
+    # A bare data URL is not valid JSON — check it before parsing.
+    if raw.startswith("data:"):
+        return raw if len(raw) > 128 else ""
     try:
         parsed = json.loads(raw)
         if isinstance(parsed, dict):
-            art = parsed.get("artworkData") or parsed.get("artwork") or ""
+            art = (
+                parsed.get("artworkData")
+                or parsed.get("artwork")
+                or parsed.get("kMRMediaRemoteNowPlayingInfoArtworkData")
+                or ""
+            )
         else:
             art = ""
     except json.JSONDecodeError:
         kv = _parse_kv_output(raw)
-        art = str(kv.get("artworkData") or kv.get("artwork") or "")
+        art = str(
+            kv.get("artworkData")
+            or kv.get("artwork")
+            or kv.get("kMRMediaRemoteNowPlayingInfoArtworkData")
+            or ""
+        )
     if not isinstance(art, str) or not art:
         return ""
     if art.startswith("data:"):
-        return art
+        return art if len(art) > 128 else ""
     cleaned = "".join(art.split())
-    if cleaned and len(cleaned) > 32:
-        return f"data:image/jpeg;base64,{cleaned}"
-    return ""
+    # nowplaying-cli can print a byte description instead of base64 — ship the
+    # cover only when it really is decodable image data.
+    if len(cleaned) < 128 or not _B64_RE.match(cleaned):
+        return ""
+    try:
+        data = base64.b64decode(cleaned, validate=True)
+    except (ValueError, TypeError):
+        return ""
+    mime = _image_mime(data)
+    if not mime:
+        return ""
+    return f"data:{mime};base64,{cleaned}"
+
+
+def _sips_to_data_url(src: Path) -> str:
+    """Convert whatever landed on disk (legacy PICT from Music's `data`
+    property) into a JPEG data URL using the system ImageIO."""
+    out = src.with_name(src.name + ".jpg")
+    data = b""
+    try:
+        proc = subprocess.run(
+            ["sips", "-s", "format", "jpeg", str(src), "--out", str(out)],
+            capture_output=True,
+            text=True,
+            timeout=3.0,
+            check=False,
+        )
+        if proc.returncode == 0:
+            data = out.read_bytes()
+    except Exception:  # noqa: BLE001 — cover is best-effort
+        return ""
+    finally:
+        try:
+            out.unlink()
+        except OSError:
+            pass
+    return _data_url_from_bytes(data)
+
+
+def _fetch_artwork_applescript() -> str:
+    """Music.app cover via AppleScript → temp file → data URL.
+
+    Stock-macOS path: needs no Homebrew. The nowplaying-cli route is optional
+    and is frequently absent, which used to leave /artwork empty forever.
+
+    `raw data` is the original JPEG/PNG; `data` is typed `picture` (legacy
+    PICT) and is only a fallback that goes through sips.
+    """
+    if platform.system() != "Darwin":
+        return ""
+    # Never `tell application "Music"` before this check — that would launch it.
+    if not _process_exists("Music"):
+        return ""
+    tmp = _ARTWORK_TMP
+    try:
+        tmp.unlink()
+    except OSError:
+        pass
+    script = f'''
+    tell application "Music"
+      try
+        if (count of artwork of current track) is 0 then return "EMPTY"
+      on error
+        return "NO_ART"
+      end try
+      try
+        set artData to raw data of artwork 1 of current track
+      on error
+        try
+          set artData to data of artwork 1 of current track
+        on error
+          return "NO_ART"
+        end try
+      end try
+    end tell
+    try
+      set f to open for access (POSIX file "{tmp}") with write permission
+      set eof f to 0
+      write artData to f
+      close access f
+    on error
+      try
+        close access (POSIX file "{tmp}")
+      end try
+      return "WRITE_FAIL"
+    end try
+    return "OK"
+    '''
+    if run_osascript(script, timeout=3.0) != "OK":
+        return ""
+    try:
+        data = tmp.read_bytes()
+    except OSError:
+        data = b""
+    art = _data_url_from_bytes(data)
+    if not art and data:
+        art = _sips_to_data_url(tmp)
+    try:
+        tmp.unlink()
+    except OSError:
+        pass
+    return art
+
+
+def _download_artwork_url(url: str) -> str:
+    if not url.startswith(("http://", "https://")):
+        return ""
+    import urllib.request
+
+    try:
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "awesome-time-bridge/2.0"}
+        )
+        with urllib.request.urlopen(req, timeout=2.0) as resp:
+            if int(getattr(resp, "status", 200) or 0) != 200:
+                return ""
+            data = resp.read(4 * 1024 * 1024)
+    except Exception:  # noqa: BLE001 — cover is best-effort
+        return ""
+    return _data_url_from_bytes(data)
+
+
+def _fetch_artwork_spotify() -> str:
+    """Spotify exposes an https cover URL instead of raw bytes."""
+    if platform.system() != "Darwin" or not _process_exists("Spotify"):
+        return ""
+    url = run_osascript(
+        'tell application "Spotify" to get artwork url of current track',
+        timeout=1.2,
+    )
+    return _download_artwork_url(url)
 
 
 def fetch_artwork_macos() -> str:
+    """Cover in three steps: MediaRemote helper → Music AppleScript → Spotify."""
     raw = nowplaying_cli(["get", "--json", "artworkData"], timeout=1.6)
-    return _artwork_data_url(raw or "")
+    art = _artwork_data_url(raw or "")
+    if art:
+        return art
+    art = _fetch_artwork_applescript()
+    if art:
+        return art
+    return _fetch_artwork_spotify()
+
+
+def probe_artwork_sources() -> dict[str, Any]:
+    """Diagnostics for GET /artwork/diag — which cover source actually works."""
+    helper = _nowplaying_exe()
+    art_helper = ""
+    if helper:
+        art_helper = _artwork_data_url(
+            nowplaying_cli(["get", "--json", "artworkData"], timeout=1.6) or ""
+        )
+    music_running = _process_exists("Music")
+    art_music = _fetch_artwork_applescript()
+    art_spotify = _fetch_artwork_spotify()
+    chosen = (
+        "nowplaying-cli"
+        if art_helper
+        else "music-applescript"
+        if art_music
+        else "spotify"
+        if art_spotify
+        else ""
+    )
+    stored = STORE.artwork_only()
+    return {
+        "chosen": chosen,
+        "storedBytes": len(stored),
+        "storedMime": stored.split(";", 1)[0].replace("data:", "") if stored else "",
+        "sources": {
+            "nowplaying-cli": {"path": helper or "", "bytes": len(art_helper)},
+            "music-applescript": {
+                "musicRunning": music_running,
+                "bytes": len(art_music),
+            },
+            "spotify": {"bytes": len(art_spotify)},
+        },
+    }
+
+
+ARTWORK_RETRY_S = 3.0
 
 
 def artwork_poller() -> None:
     last_key: tuple[Any, ...] = ()
+    last_try = 0.0
     while True:
         try:
             if platform.system() == "Darwin":
                 snap = STORE.snapshot()
                 key = (snap.get("title"), snap.get("artist"), snap.get("album"))
-                if key != last_key:
+                title = str(snap.get("title") or "")
+                fresh = key != last_key
+                # A cover can land late (streaming art, permission prompt,
+                # player still starting) — retry instead of caching the miss.
+                due = fresh or (
+                    bool(title)
+                    and not STORE.artwork_only()
+                    and time.time() - last_try >= ARTWORK_RETRY_S
+                )
+                if due:
                     last_key = key
-                    art = fetch_artwork_macos() if snap.get("title") else ""
+                    last_try = time.time()
+                    art = fetch_artwork_macos() if title else ""
+                    # Empty art is stored too, so a stale cover never sticks to
+                    # the next track.
                     if STORE.set_artwork(art) and HUB.count:
-                        HUB.broadcast_obj({"type": "art", "seq": STORE.snapshot().get("seq", 0)})
+                        HUB.broadcast_obj(
+                            {"type": "art", "seq": STORE.snapshot().get("seq", 0)}
+                        )
         except Exception as exc:  # noqa: BLE001
             print(f"[bridge] artwork poll error: {exc}", file=sys.stderr)
         time.sleep(0.4)
@@ -1772,13 +2023,50 @@ def lan_ips() -> list[str]:
     return out
 
 
-def _bridge_name() -> str:
-    import socket
+# Hostnames that tell the user nothing when picking a bridge to pair with.
+_USELESS_HOSTNAMES = frozenset(
+    {
+        "",
+        "bogon",
+        "localhost",
+        "localhost.localdomain",
+        "localhost4",
+        "localhost6",
+        "ip6-localhost",
+    }
+)
 
+
+def _bridge_name() -> str:
+    """Human-readable machine name shown in the phone's device list.
+
+    ``socket.gethostname()`` is frequently a reverse-DNS placeholder such as
+    ``bogon``, so on macOS the ComputerName (what Sharing settings calls this
+    Mac) wins when it is readable. Falls back to the hostname, then to a
+    generic label.
+    """
+    candidates: list[str] = []
+    if sys.platform == "darwin":
+        try:
+            proc = subprocess.run(
+                ["scutil", "--get", "ComputerName"],
+                capture_output=True,
+                text=True,
+                timeout=2.0,
+            )
+            if proc.returncode == 0:
+                candidates.append(proc.stdout)
+        except Exception:
+            pass
     try:
-        return socket.gethostname() or "Awesome Time Bridge"
+        candidates.append(socket.gethostname())
     except Exception:
-        return "Awesome Time Bridge"
+        pass
+    for candidate in candidates:
+        name = (candidate or "").strip()
+        if name and name.lower() not in _USELESS_HOSTNAMES:
+            return name
+    return "Awesome Time Bridge"
 
 
 def discovery_loop(discovery_port: int, http_port: int) -> None:

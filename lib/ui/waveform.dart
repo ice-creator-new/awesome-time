@@ -1,4 +1,5 @@
 import 'dart:math';
+import 'dart:ui' as ui;
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
@@ -80,9 +81,17 @@ class _WaveformState extends State<Waveform>
       if (d > maxDelta) maxDelta = d;
 
       if (_levels[i] >= _peaks[i]) {
+        final rise = (_levels[i] - _peaks[i]).abs();
+        if (rise > maxDelta) maxDelta = rise;
         _peaks[i] = _levels[i];
       } else {
+        final peakBefore = _peaks[i];
         _peaks[i] = max(_levels[i], _peaks[i] - peakFall);
+        // The peak caps fall on their own clock, so their movement has to count
+        // as a reason to repaint too — otherwise a quiet passage freezes them
+        // mid-air and they jump when the level moves again.
+        final fall = (peakBefore - _peaks[i]).abs();
+        if (fall > maxDelta) maxDelta = fall;
       }
     }
 
@@ -119,12 +128,13 @@ class _WaveformState extends State<Waveform>
     super.dispose();
   }
 
-  /// Dense thin bars: pitch ≈ 5px (2.5px bar + 2.5px gap), square ends.
+  /// Bars per row, rounded so [paint] can widen each bar to span the width
+  /// edge to edge at a pitch of ≈ 6.5px landscape / 6px on a cover.
   int _barCount(double width) {
-    final pitch = widget.expanded ? 5.0 : 4.5;
-    final gap = widget.expanded ? 2.5 : 2.0;
-    final n = ((width + gap) / pitch).floor();
-    return max(32, min(120, n));
+    final pitch = widget.expanded ? 6.5 : 6.0;
+    final gap = widget.expanded ? 3.3 : 2.8;
+    final n = ((width + gap) / pitch).round();
+    return max(16, min(160, n));
   }
 
   @override
@@ -167,37 +177,18 @@ class _WavePainter extends CustomPainter {
   final List<Color> colors;
   final bool expanded;
 
-  static double _hueDist(double a, double b) {
-    final d = (a - b).abs();
-    return d > 180 ? 360 - d : d;
-  }
-
-  /// Meter ink: bright, saturated, and pushed off the ambient wash hue
-  /// when it would otherwise disappear into the background.
-  static Color _meter(Color base, List<Color> ambient) {
-    var hsl = HSLColor.fromColor(base);
-    // If this hue is already used by the backdrop, rotate toward the
-    // opposite side of the wheel so bars never share the wash hue.
-    var minAmbient = 360.0;
-    for (final a in ambient) {
-      final d = _hueDist(hsl.hue, HSLColor.fromColor(a).hue);
-      if (d < minAmbient) minAmbient = d;
-    }
-    if (minAmbient < 40) {
-      hsl = hsl.withHue((hsl.hue + 150) % 360);
-    } else if (minAmbient < 70) {
-      hsl = hsl.withHue((hsl.hue + 55) % 360);
-    }
-
-    // High lightness so thin bars read on dark *and* mid ambient.
+  /// Meter ink: the cover's own hue, lifted so the bars glow on dark *and*
+  /// mid-tone artwork. Rotating the hue away from the backdrop (the old
+  /// behaviour) made the meter fight the palette instead of belonging to it.
+  static Color _meter(Color base) {
+    final hsl = HSLColor.fromColor(base);
     return hsl
-        .withSaturation((hsl.saturation * 1.1 + 0.35).clamp(0.55, 1.0))
-        .withLightness(0.74)
+        .withSaturation(hsl.saturation.clamp(0.25, 0.85))
+        .withLightness((hsl.lightness + 0.18).clamp(0.52, 0.80))
         .toColor();
   }
 
-  Color? _cacheC0;
-  Color? _cacheC1;
+  Color? _cacheInk;
   int _cachePal = -1;
 
   @override
@@ -206,49 +197,45 @@ class _WavePainter extends CustomPainter {
     canvas.clipRect(Offset.zero & size);
 
     final n = levels.length;
-    final gap = expanded ? 2.5 : 2.0;
-    const targetBar = 2.5;
-    var barW = targetBar;
-    final totalGaps = gap * (n - 1);
-    if (totalGaps + barW * n > size.width) {
-      barW = max(1.5, (size.width - totalGaps) / n);
-    }
-    final used = n * barW + totalGaps;
+    // Fill the row: the bar width absorbs whatever the rounded bar count
+    // leaves over, so the meter spans the full cover instead of floating in
+    // the middle with dead space on both sides.
+    final gap = expanded ? 3.3 : 2.8;
+    final barW = ((size.width - gap * (n - 1)) / n).clamp(1.6, 12.0);
+    final used = n * barW + gap * (n - 1);
     final originX = max(0.0, (size.width - used) / 2);
     final floor = size.height;
-    final maxH = size.height * 0.94;
+    final maxH = size.height * 0.92;
+    final radius = Radius.circular(barW / 2);
 
     final palId = Object.hashAll([
       for (final c in colors.take(4)) c.toARGB32(),
       expanded,
     ]);
-    if (_cachePal != palId || _cacheC0 == null) {
-      final raw0 = colors.isNotEmpty ? colors[0] : const Color(0xFFFF9F43);
-      final raw1 = colors.length > 1 ? colors[1] : raw0;
-      _cacheC0 = _meter(raw0, colors);
-      _cacheC1 = _meter(raw1, colors);
+    if (_cachePal != palId || _cacheInk == null) {
+      final raw = colors.isNotEmpty ? colors[0] : const Color(0xFFFF9F43);
+      _cacheInk = _meter(raw);
       _cachePal = palId;
     }
-    final c0 = _cacheC0!;
-    final c1 = _cacheC1!;
+    final ink = _cacheInk!;
 
-    // No scrim behind bars — a dark trough read as a hard layered band
-    // against the ambient wash. Contrast comes from meter color + edges only.
-    canvas.drawLine(
-      Offset(originX, floor - 0.5),
-      Offset(min(size.width, originX + used), floor - 0.5),
-      Paint()
-        ..color = Colors.white.withValues(alpha: 0.22)
-        ..strokeWidth = 1,
-    );
-
-    final bodyPaint = Paint();
-    final shadowPaint = Paint()
-      ..color = const Color(0x66000000)
-      ..strokeWidth = 0;
-    final tipPaint = Paint();
+    // One vertical ramp for the whole meter: quiet bars sit low in the
+    // gradient, loud ones reach the bright end. A per-bar colour ramp (the old
+    // behaviour) turned the field into flickering confetti, and per-bar drop
+    // shadows plus near-white crowns read as dirt on top of the artwork.
+    final body = Paint()
+      ..shader = ui.Gradient.linear(
+        Offset(0, floor - maxH),
+        Offset(0, floor),
+        [
+          Color.lerp(ink, Colors.white, 0.55)!.withValues(alpha: 0.95),
+          ink.withValues(alpha: 0.55),
+        ],
+      );
+    final peakBase = Color.lerp(ink, Colors.white, 0.75)!;
     final peakPaint = Paint()
-      ..color = Colors.white.withValues(alpha: playing ? 0.85 : 0.35);
+      ..color = peakBase.withValues(alpha: playing ? 0.5 : 0.22);
+    final peakAlpha = playing ? 0.5 : 0.22;
 
     for (var i = 0; i < n; i++) {
       final x = originX + i * (barW + gap);
@@ -256,42 +243,40 @@ class _WavePainter extends CustomPainter {
       final w = min(barW, size.width - x);
       if (w <= 0) break;
 
-      final level = levels[i].clamp(0.0, 1.0);
-      final h = maxH * pow(level, 0.88).toDouble();
-      final u = n == 1 ? 0.0 : i / (n - 1);
+      // Three-point smoothing keeps the envelope continuous instead of
+      // flickering bar to bar.
+      final prev = i > 0 ? levels[i - 1] : levels[i];
+      final next = i < n - 1 ? levels[i + 1] : levels[i];
+      final level =
+          (levels[i] * 0.6 + prev * 0.22 + next * 0.18).clamp(0.0, 1.0);
+      final h = max(1.6, maxH * pow(level, 0.82).toDouble());
+      canvas.drawRRect(
+        RRect.fromRectAndRadius(
+          Rect.fromLTRB(x, floor - h, x + w, floor),
+          radius,
+        ),
+        body,
+      );
 
-      final base = Color.lerp(c0, c1, u)!;
-      // Floor opacity so quiet bars still punch through the wash.
-      final energy = playing ? level : level * 0.5;
-      final a = (0.55 + 0.45 * energy).clamp(0.5, 1.0);
-
-      if (h >= 3) {
-        final rect = Rect.fromLTRB(x, floor - h, x + w, floor);
-        // Soft dark edge behind the bar for contrast on matching hues.
-        canvas.drawRect(
-          rect.translate(0.75, 0.75),
-          shadowPaint..color = const Color(0x55000000),
-        );
-        bodyPaint.color = base.withValues(alpha: a);
-        canvas.drawRect(rect, bodyPaint);
-
-        // Near-white crown on hits — always separates from ambient.
-        if (h >= 16 && level > 0.35) {
-          final tipH = min(h * 0.14, 7.0);
-          tipPaint.color = Color.lerp(base, Colors.white, 0.7)!
-              .withValues(alpha: (a * 0.95).clamp(0.0, 1.0));
-          canvas.drawRect(
-            Rect.fromLTRB(x, floor - h, x + w, floor - h + tipH),
-            tipPaint,
-          );
-        }
-      }
-
+      // Peak cap. It fades in as it separates from the bar and fades out again
+      // as it drops back down, instead of popping in and out on a threshold —
+      // and it dims near the baseline rather than being cut off there.
       final peak = peaks[i].clamp(0.0, 1.0);
-      if (peak > 0.15 && peak - level > 0.08) {
-        final py = floor - maxH * pow(peak, 0.88).toDouble();
-        if (py < floor - 6) {
-          canvas.drawRect(Rect.fromLTRB(x, py - 2, x + w, py), peakPaint);
+      final peakGap = peak - level;
+      if (peakGap > 0.015 && peak > 0.02) {
+        final py = floor - maxH * pow(peak, 0.82).toDouble();
+        final separation = (peakGap / 0.16).clamp(0.0, 1.0);
+        final headroom = ((floor - py) / 14.0).clamp(0.0, 1.0);
+        final alpha = peakAlpha * separation * headroom;
+        if (alpha > 0.01) {
+          peakPaint.color = peakBase.withValues(alpha: alpha);
+          canvas.drawRRect(
+            RRect.fromRectAndRadius(
+              Rect.fromLTRB(x, py - 1.5, x + w, py),
+              const Radius.circular(1),
+            ),
+            peakPaint,
+          );
         }
       }
     }

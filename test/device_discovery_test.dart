@@ -29,4 +29,41 @@ void main() {
     expect(DeviceDiscovery.magic, 'AWESOME_TIME_DISCOVER');
     expect(DeviceDiscovery.discoveryPort, 8766);
   });
+
+  group('broadcastCandidates', () {
+    test('covers a home /24 LAN', () {
+      expect(
+        DeviceDiscovery.broadcastCandidates('192.168.1.10'),
+        contains('192.168.1.255'),
+      );
+    });
+
+    test('covers an office /19 LAN (the old /24 guess missed it)', () {
+      final candidates = DeviceDiscovery.broadcastCandidates('10.192.201.26');
+      // Real broadcast of 10.192.201.26/19, as reported by `ip addr`.
+      expect(candidates, contains('10.192.223.255'));
+      // The old hardcoded guess stays in the set; harmless as an extra probe.
+      expect(candidates, contains('10.192.201.255'));
+    });
+
+    test('covers a /20 LAN', () {
+      expect(
+        DeviceDiscovery.broadcastCandidates('10.192.43.182'),
+        contains('10.192.47.255'),
+      );
+    });
+
+    test('deduplicates overlapping prefixes', () {
+      final candidates = DeviceDiscovery.broadcastCandidates('10.192.201.26');
+      expect(candidates.toSet().length, candidates.length);
+      expect(candidates, isNotEmpty);
+    });
+
+    test('rejects malformed addresses', () {
+      expect(DeviceDiscovery.broadcastCandidates('not-an-ip'), isEmpty);
+      expect(DeviceDiscovery.broadcastCandidates('10.0.0'), isEmpty);
+      expect(DeviceDiscovery.broadcastCandidates('10.0.0.999'), isEmpty);
+      expect(DeviceDiscovery.broadcastCandidates(''), isEmpty);
+    });
+  });
 }

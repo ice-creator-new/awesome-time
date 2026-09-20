@@ -33,6 +33,7 @@
 | `WS /ws` | 推送播放状态和频谱；接收控制命令。进度约每 0.5s 推送一次 |
 | `UDP :8766` | 局域网设备发现（`AWESOME_TIME_DISCOVER`） |
 | `GET /artwork` | 单独拉封面，避免大图堵住频谱 |
+| `GET /artwork/diag` | 排查封面：各来源是否可用、最终生效的是哪一个 |
 | `GET /state` | HTTP 回退 |
 | `POST /cmd` | HTTP 回退控制 |
 | `GET /health` | 探活（含设备名） |
@@ -59,6 +60,14 @@ brew install nowplaying-cli
 ```
 
 安装后能读系统 Now Playing（浏览器、音乐 App 等）。没装时回退到 Music / Spotify / Podcasts / VLC / IINA 的 AppleScript，以及浏览器标题启发式。
+
+封面按三级来源获取，**不依赖 `nowplaying-cli`**：`nowplaying-cli` → Music.app 的 AppleScript（取 `raw data` 原始图，PICT 兜底走 `sips` 转 JPEG）→ Spotify 的 artwork URL。若客户端没有封面，先看诊断：
+
+```bash
+curl -s http://127.0.0.1:8765/artwork/diag
+```
+
+`chosen` 字段就是当前生效的来源。封面晚到（流媒体图未加载、权限刚授予）会自动重试，切歌后不会残留上一首的封面。
 
 首次控制若弹权限：
 

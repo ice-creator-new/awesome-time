@@ -78,10 +78,13 @@ class PlayerController extends ChangeNotifier {
     final now = DateTime.now();
     _lastRemoteAt = now;
 
+    // Only a real title change counts as a new track. The bridge's `source`
+    // label can flip between the player name and a fallback while the same song
+    // keeps playing; treating that as a track change forced the progress bar to
+    // re-anchor (and looked like the position jumping). A genuine scrub is still
+    // caught by the jump check below.
     final trackChanged =
-        state.title != remote.title ||
-        state.source != remote.source ||
-        state.updatedAtMs == 0;
+        state.title != remote.title || state.updatedAtMs == 0;
 
     final holdPos = _holdPositionUntil != null && now.isBefore(_holdPositionUntil!);
     final holdPlay = _holdPlayingUntil != null && now.isBefore(_holdPlayingUntil!);
