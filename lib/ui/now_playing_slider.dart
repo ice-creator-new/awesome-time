@@ -103,25 +103,31 @@ class NowPlayingVolume extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Row(
+    return Column(
+      mainAxisSize: MainAxisSize.min,
       children: [
-        const PlayerIcon(
-          glyph: PlayerGlyph.volumeMin,
-          color: Color(0x99FFFFFF),
-          size: 20,
+        _HairlineSlider(
+          value: volume.clamp(0.0, 1.0),
+          enabled: true,
+          onChanged: onChange,
+          onChangeEnd: onChange,
         ),
-        Expanded(
-          child: _HairlineSlider(
-            value: volume.clamp(0.0, 1.0),
-            enabled: true,
-            onChanged: onChange,
-            onChangeEnd: onChange,
-          ),
-        ),
-        const PlayerIcon(
-          glyph: PlayerGlyph.volumeMax,
-          color: Color(0x99FFFFFF),
-          size: 20,
+        const SizedBox(height: 6),
+        // Icons under the bar, mirroring the scrubber's time row.
+        const Row(
+          children: [
+            PlayerIcon(
+              glyph: PlayerGlyph.volumeMin,
+              color: Color(0x99FFFFFF),
+              size: 16,
+            ),
+            Spacer(),
+            PlayerIcon(
+              glyph: PlayerGlyph.volumeMax,
+              color: Color(0x99FFFFFF),
+              size: 16,
+            ),
+          ],
         ),
       ],
     );
@@ -218,7 +224,7 @@ class _HairlineSliderState extends State<_HairlineSlider>
               animation: _press,
               builder: (context, _) {
                 final t = Curves.easeOutCubic.transform(_press.value);
-                final trackH = 3.0 + 9.0 * t;
+                final trackH = 4.5 + 9.5 * t;
                 return Stack(
                   alignment: Alignment.centerLeft,
                   children: [

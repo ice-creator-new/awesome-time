@@ -1,57 +1,80 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 
 import '../state/player_controller.dart';
-import 'ambient_backdrop.dart';
 import 'generated_cover.dart';
 import 'now_playing_slider.dart';
 import 'player_icons.dart';
 import 'waveform.dart';
 
-class PlayerPage extends StatelessWidget {
-  const PlayerPage({super.key});
+/// Media panel: the now-playing instrument.
+///
+/// Deliberately has no scaffold or background of its own — the home pager
+/// slides it over the shared ambient backdrop.
+class MediaView extends StatelessWidget {
+  const MediaView({super.key});
 
   @override
   Widget build(BuildContext context) {
     final c = context.watch<PlayerController>();
-    final st = c.state;
-    final connected = c.isConnected;
-
-    return AnnotatedRegion<SystemUiOverlayStyle>(
-      value: SystemUiOverlayStyle.light.copyWith(
-        statusBarColor: Colors.transparent,
-        systemNavigationBarColor: Colors.transparent,
-      ),
-      child: Scaffold(
-        backgroundColor: const Color(0xFF0A0C10),
-        extendBody: true,
-        extendBodyBehindAppBar: true,
-        body: Stack(
-          fit: StackFit.expand,
-          children: [
-            AmbientBackdrop(
-              colors: c.palette,
-              playing: st.playing && st.hasTrack,
-            ),
-            SafeArea(
-              top: false,
-              bottom: false,
-              child: connected
-                  ? _NowPlaying(controller: c)
-                  : _DisconnectedPanel(controller: c),
-            ),
-          ],
-        ),
-      ),
-    );
+    return c.isConnected
+        ? _NowPlaying(controller: c)
+        : _DisconnectedPanel(controller: c);
   }
 }
 
-class _NowPlaying extends StatelessWidget {
+class _NowPlaying extends StatefulWidget {
   const _NowPlaying({required this.controller});
 
   final PlayerController controller;
+
+  @override
+  State<_NowPlaying> createState() => _NowPlayingState();
+}
+
+class _NowPlayingState extends State<_NowPlaying> {
+  /// Landscape only: the transport rides the cover, starts hidden, and fades
+  /// out again once the user stops interacting with it.
+  static const Duration _autoHideAfter = Duration(seconds: 5);
+
+  bool _controlsVisible = false;
+  Timer? _hideTimer;
+
+  PlayerController get controller => widget.controller;
+
+  @override
+  void dispose() {
+    _hideTimer?.cancel();
+    super.dispose();
+  }
+
+  void _restartHideTimer() {
+    _hideTimer?.cancel();
+    _hideTimer = Timer(_autoHideAfter, () {
+      if (!mounted) return;
+      setState(() => _controlsVisible = false);
+    });
+  }
+
+  /// Any deliberate interaction — tapping the cover or pressing a transport
+  /// button — restarts the countdown.
+  void _keepControlsAlive() {
+    if (_controlsVisible) _restartHideTimer();
+  }
+
+  void _toggleControls() {
+    if (_controlsVisible) {
+      _hideTimer?.cancel();
+      _hideTimer = null;
+      setState(() => _controlsVisible = false);
+    } else {
+      setState(() => _controlsVisible = true);
+      _restartHideTimer();
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -76,6 +99,32 @@ class _NowPlaying extends StatelessWidget {
                   bytes: controller.artworkBytes,
                   colors: controller.palette,
                   maxSide: 360,
+                  // Spectrum rides the cover: bottom-aligned with no gap, and
+                  // clipped by the cover's rounded corners.
+                  overlay: Align(
+                    alignment: Alignment.bottomCenter,
+                    child: DecoratedBox(
+                      // Faint scrim: the meter has to stay legible on pale
+                      // artwork, and it keeps the bottom edge from reading as a
+                      // hard cut.
+                      decoration: const BoxDecoration(
+                        gradient: LinearGradient(
+                          begin: Alignment.bottomCenter,
+                          end: Alignment.topCenter,
+                          colors: [Color(0x8A000000), Color(0x00000000)],
+                        ),
+                      ),
+                      child: FractionallySizedBox(
+                        heightFactor: 0.38,
+                        widthFactor: 1,
+                        child: Waveform(
+                          spectrum: controller.spectrum,
+                          playing: st.playing && st.hasTrack,
+                          colors: controller.palette,
+                        ),
+                      ),
+                    ),
+                  ),
                 ),
               ),
             ),
@@ -89,102 +138,139 @@ class _NowPlaying extends StatelessWidget {
 
   Widget _landscape(BuildContext context) {
     final st = controller.state;
-    return Stack(
-      children: [
-        Padding(
-          padding: const EdgeInsets.fromLTRB(16, 12, 20, 20),
-          child: LayoutBuilder(
-            builder: (context, constraints) {
-              final art = (constraints.maxHeight * 0.88)
-                  .clamp(160.0, 420.0)
-                  .clamp(0.0, constraints.maxWidth * 0.42);
-              return Row(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  Center(
-                    child: SizedBox(
-                      width: art,
-                      height: art,
-                      child: _ArtworkHero(
-                        playing: st.playing && st.hasTrack,
-                        title: st.title,
-                        bytes: controller.artworkBytes,
-                        colors: controller.palette,
-                        maxSide: art,
-                      ),
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 12, 20, 20),
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          // Cover spans the content box, so the title shares its top edge and
+          // the meter shares its bottom edge.
+          final art = constraints.maxHeight
+              .clamp(120.0, 900.0)
+              .clamp(0.0, constraints.maxWidth * 0.52);
+          final waveHeight = (constraints.maxHeight * 0.28).clamp(56.0, 108.0);
+          return Row(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Align(
+                alignment: Alignment.topCenter,
+                child: GestureDetector(
+                  key: const Key('cover-tap'),
+                  // Tap the cover to show/hide the transport.
+                  behavior: HitTestBehavior.opaque,
+                  onTap: _toggleControls,
+                  child: SizedBox(
+                    width: art,
+                    height: art,
+                    child: _ArtworkHero(
+                      playing: st.playing && st.hasTrack,
+                      title: st.title,
+                      bytes: controller.artworkBytes,
+                      colors: controller.palette,
+                      maxSide: art,
+                      overlay: _coverControls(),
                     ),
                   ),
-                  const SizedBox(width: 28),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                ),
+              ),
+              const SizedBox(width: 28),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    _TitleBlock(
+                      title: st.hasTrack ? st.title : '等待媒体…',
+                      artist: st.hasTrack
+                          ? [
+                              if (st.artist.isNotEmpty) st.artist,
+                              if (st.album.isNotEmpty) st.album,
+                            ].join(' · ')
+                          : (st.source.isEmpty ? '电脑上开始播放' : st.source),
+                      hasTrack: st.hasTrack,
+                      compact: true,
+                    ),
+                    const SizedBox(height: 14),
+                    // Progress takes 2/3, volume 1/3; each keeps its labels
+                    // underneath the bar.
+                    Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        const SizedBox(height: 8),
-                        _TitleBlock(
-                          title: st.hasTrack ? st.title : '等待媒体…',
-                          artist: st.hasTrack
-                              ? [
-                                  if (st.artist.isNotEmpty) st.artist,
-                                  if (st.album.isNotEmpty) st.album,
-                                ].join(' · ')
-                              : (st.source.isEmpty ? '电脑上开始播放' : st.source),
-                          hasTrack: st.hasTrack,
-                          compact: true,
-                        ),
-                        const SizedBox(height: 8),
-                        Row(
-                          crossAxisAlignment: CrossAxisAlignment.center,
-                          children: [
-                            Expanded(
-                              flex: 5,
-                              child: _Transport(
-                                playing: st.playing,
-                                enabled: true,
-                                compact: true,
-                                onPlayPause: controller.playPause,
-                                onNext: controller.next,
-                                onPrev: controller.prev,
-                              ),
-                            ),
-                            const SizedBox(width: 12),
-                            Expanded(
-                              flex: 6,
-                              child: Column(
-                                children: [
-                                  NowPlayingScrubber(
-                                    clock: controller.clock,
-                                    enabled: st.hasDuration,
-                                    onSeek: controller.seekFraction,
-                                  ),
-                                  NowPlayingVolume(
-                                    volume: st.volume,
-                                    onChange: controller.setVolume,
-                                  ),
-                                ],
-                              ),
-                            ),
-                          ],
-                        ),
-                        const SizedBox(height: 8),
                         Expanded(
-                          child: ClipRect(
-                            child: Waveform(
-                              spectrum: controller.spectrum,
-                              playing: st.playing && st.hasTrack,
-                              colors: controller.palette,
-                              expanded: true,
-                            ),
+                          flex: 2,
+                          child: NowPlayingScrubber(
+                            clock: controller.clock,
+                            enabled: st.hasDuration,
+                            onSeek: controller.seekFraction,
+                          ),
+                        ),
+                        const SizedBox(width: 20),
+                        Expanded(
+                          flex: 1,
+                          child: NowPlayingVolume(
+                            volume: st.volume,
+                            onChange: controller.setVolume,
                           ),
                         ),
                       ],
                     ),
-                  ),
-                ],
-              );
-            },
+                    const Spacer(),
+                    SizedBox(
+                      height: waveHeight,
+                      child: ClipRect(
+                        child: Waveform(
+                          spectrum: controller.spectrum,
+                          playing: st.playing && st.hasTrack,
+                          colors: controller.palette,
+                          expanded: true,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+  }
+
+  /// Landscape transport, painted on the cover and toggled by tapping it.
+  Widget _coverControls() {
+    final st = controller.state;
+    return IgnorePointer(
+      ignoring: !_controlsVisible,
+      child: AnimatedOpacity(
+        key: const Key('cover-controls'),
+        opacity: _controlsVisible ? 1.0 : 0.0,
+        duration: const Duration(milliseconds: 220),
+        curve: Curves.easeOut,
+        child: ColoredBox(
+          // Light scrim so white glyphs stay readable on pale covers.
+          color: Colors.black.withValues(alpha: 0.26),
+          child: Center(
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 8),
+              child: _Transport(
+                playing: st.playing,
+                enabled: true,
+                compact: true,
+                onPlayPause: () {
+                  controller.playPause();
+                  _keepControlsAlive();
+                },
+                onNext: () {
+                  controller.next();
+                  _keepControlsAlive();
+                },
+                onPrev: () {
+                  controller.prev();
+                  _keepControlsAlive();
+                },
+              ),
+            ),
           ),
         ),
-      ],
+      ),
     );
   }
 }
@@ -241,6 +327,7 @@ class _ArtworkHero extends StatelessWidget {
     required this.bytes,
     required this.colors,
     this.maxSide = 360,
+    this.overlay,
   });
 
   final bool playing;
@@ -248,6 +335,9 @@ class _ArtworkHero extends StatelessWidget {
   final Uint8List? bytes;
   final List<Color> colors;
   final double maxSide;
+
+  /// Painted on top of the artwork, inside the cover's rounded clip.
+  final Widget? overlay;
 
   @override
   Widget build(BuildContext context) {
@@ -284,7 +374,13 @@ class _ArtworkHero extends StatelessWidget {
             ),
             child: ClipRRect(
               borderRadius: BorderRadius.circular(14),
-              child: art,
+              child: Stack(
+                fit: StackFit.expand,
+                children: [
+                  art,
+                  ?overlay,
+                ],
+              ),
             ),
           ),
         );
